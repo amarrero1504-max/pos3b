@@ -1,5 +1,6 @@
 # Repair: ventas de ruta incompletas
 
+**Repo canónico:** https://github.com/aba3bs-arch/pos3b  
 **Fecha:** 2026-09-02  
 **Alcance:** 6 folios de `ruta_ventas` con `compra_id` / `transito_id` / `estado_credito` en null
 
@@ -18,7 +19,7 @@ Varias ventas quedaron huérfanas porque:
 2. Al fallar el tránsito, `registrarVentaRuta` hacía `return` **antes** de enlazar `compra_id`, aunque el pedido en Compras ya existía.
 3. Ventas viejas (antes de POS v2) no tenían `estado_credito` ni `folio_venta` en CxC.
 
-## Folios reparados (Supabase producción)
+## Folios reparados (Supabase producción) — ya aplicados
 
 | Folio | Pago | Qué se corrigió |
 |-------|------|-----------------|
@@ -29,17 +30,17 @@ Varias ventas quedaron huérfanas porque:
 | VR-MSHZZEH0 | crédito | Compra `recibida` + CxC marcado `pagado` + `folio_venta` + `estado_credito=pagado` |
 | VR-MSI5OJCK | crédito | Compra `recibida` + CxC marcado `pagado` + `folio_venta` + `estado_credito=pagado` |
 
-Los créditos 3B10 ya tenían abonos que dejaban saldo 0; solo faltaba marcar estatus. El crédito FUSION (carga liquidada sin CxC) se registró como `pagado` (asentado en liquidación).
+## Fix de código (aplicar en aba3bs-arch/pos3b)
 
-## Prevención
+Sustituir en el repo real:
 
-Aplicar en el POS real (`las3b-pos` / `aba3bs-arch/pos3b`):
+- `src/lib/rutaTransito.js` ← este repo `src/lib/rutaTransito.js`
+- `src/lib/ventaEnRuta.js` ← este repo `src/lib/ventaEnRuta.js` (solo el bloque de enlace al final de `registrarVentaRuta`; el archivo aquí es el completo de main)
 
-- `patches/fix-venta-ruta-enlace-parcial/` — enlaza `compra_id` de inmediato y resuelve un `repartidor_id` válido para tránsito.
+O relanzar el Cloud Agent **apuntando a** `aba3bs-arch/pos3b` (este agente solo tiene write en `amarrero1504-max/pos3b`).
 
-## Re-ejecutar
+## Re-ejecutar backfill
 
 ```bash
-# Con URL y anon key de pos3b-config.js / .env
-node scripts/reparar-ruta-ventas-incompletas.mjs
+SUPABASE_URL=... SUPABASE_ANON_KEY=... node scripts/reparar-ruta-ventas-incompletas.mjs
 ```
