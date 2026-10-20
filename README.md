@@ -8,8 +8,10 @@ Mirror / herramientas del POS 3B.
 
 Veredicto: saturación de **Disk IO Budget** (no es fallo de `usuarios` ni de credenciales).
 
-- `docs/DIAGNOSTICO_SUPABASE.md` — informe completo + evidencia medida
-- `supabase/diagnostico_disk_io.sql` — correr en SQL Editor
+- `docs/DIAGNOSTICO_SUPABASE.md` — Disk IO + evidencia medida
+- `docs/ANALISIS_TABLAS_SUPABASE.md` — 104 tablas: errores, legacy, vacías, pesadas
+- `docs/tablas_supabase_inventario.json` — inventario machine-readable
+- `supabase/fix_tablas_faltantes_proyeccion.sql` — crea `carrito_remociones` + `consultas_precio`
 - `supabase/fix_disk_io_indexes.sql` — índices (seguro si falta alguna tabla)
 - `supabase/check_tablas_indexes.sql` — si falló con 42P01, verifica tablas/proyecto
-- `supabase/diagnostico_login_usuarios.sql` — si el login no encuentra usuarios
+- `supabase/diagnostico_disk_io.sql` / `diagnostico_login_usuarios.sql`

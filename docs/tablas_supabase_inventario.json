@@ -1,0 +1,938 @@
+[
+  {
+    "table": "anuncios_pos",
+    "status": "ok",
+    "rows": 22,
+    "ms": 183,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "asistencias",
+    "status": "ok",
+    "rows": 3032,
+    "ms": 108,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "auto_fin_creditos",
+    "status": "ok",
+    "rows": 6,
+    "ms": 111,
+    "code_refs": 9,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "auto_fin_cuotas",
+    "status": "ok",
+    "rows": 512,
+    "ms": 129,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "auto_fin_pagos",
+    "status": "ok",
+    "rows": 82,
+    "ms": 110,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cancelaciones",
+    "status": "ok",
+    "rows": 41,
+    "ms": 138,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "carrito_remociones",
+    "status": "missing",
+    "rows": null,
+    "ms": 133,
+    "code_refs": 1,
+    "in_code": true,
+    "err": "PGRST205: Could not find the table 'public.carrito_remociones' in the schema cache"
+  },
+  {
+    "table": "cedis_ruta_movimientos",
+    "status": "ok",
+    "rows": 0,
+    "ms": 110,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "cedis_ruta_stock",
+    "status": "ok",
+    "rows": 11,
+    "ms": 80,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "checklist_respuestas",
+    "status": "ok",
+    "rows": 7944,
+    "ms": 207,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "checklist_sesiones",
+    "status": "ok",
+    "rows": 279,
+    "ms": 168,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "clientes",
+    "status": "ok",
+    "rows": 0,
+    "ms": 125,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "clientes_maquinas",
+    "status": "ok",
+    "rows": 10,
+    "ms": 106,
+    "code_refs": 11,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "clientes_maquinas_moneda",
+    "status": "ok",
+    "rows": 1,
+    "ms": 187,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "compras",
+    "status": "ok",
+    "rows": 376,
+    "ms": 101,
+    "code_refs": 25,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "conciliaciones_abarrotes",
+    "status": "ok",
+    "rows": 0,
+    "ms": 123,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "consultas_precio",
+    "status": "missing",
+    "rows": null,
+    "ms": 122,
+    "code_refs": 1,
+    "in_code": true,
+    "err": "PGRST205: Could not find the table 'public.consultas_precio' in the schema cache"
+  },
+  {
+    "table": "cont_virtual_categorias",
+    "status": "ok",
+    "rows": 12,
+    "ms": 102,
+    "code_refs": 15,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cont_virtual_detalles",
+    "status": "ok",
+    "rows": 25,
+    "ms": 77,
+    "code_refs": 7,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cont_virtual_egresos",
+    "status": "ok",
+    "rows": 1422,
+    "ms": 165,
+    "code_refs": 19,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cont_virtual_ingresos",
+    "status": "ok",
+    "rows": 4,
+    "ms": 119,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cont_virtual_subcategorias",
+    "status": "ok",
+    "rows": 88,
+    "ms": 105,
+    "code_refs": 12,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "contabilidad_notificaciones",
+    "status": "ok",
+    "rows": 2255,
+    "ms": 108,
+    "code_refs": 11,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_caja",
+    "status": "ok",
+    "rows": 655,
+    "ms": 141,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_contabilidad_cierres",
+    "status": "ok",
+    "rows": 4462,
+    "ms": 505,
+    "code_refs": 46,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_contabilidad_estado",
+    "status": "ok",
+    "rows": 47,
+    "ms": 83,
+    "code_refs": 9,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_contabilidad_folios",
+    "status": "ok",
+    "rows": 32,
+    "ms": 91,
+    "code_refs": 7,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_contabilidad_gastos",
+    "status": "ok",
+    "rows": 4153,
+    "ms": 134,
+    "code_refs": 80,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "cortes_gasto_catalogo",
+    "status": "ok",
+    "rows": 34,
+    "ms": 97,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "descansos_autorizados",
+    "status": "ok",
+    "rows": 6,
+    "ms": 115,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "evaluacion_operativa",
+    "status": "ok",
+    "rows": 36,
+    "ms": 132,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "gastos_evidencia",
+    "status": "ok",
+    "rows": 32,
+    "ms": 108,
+    "code_refs": 14,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "gastos_evidencia_archivos",
+    "status": "ok",
+    "rows": 6,
+    "ms": 152,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "inventario_traspasos",
+    "status": "ok",
+    "rows": 22,
+    "ms": 103,
+    "code_refs": 14,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "inversiones_oficina_proveedor",
+    "status": "ok",
+    "rows": 0,
+    "ms": 89,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "inversiones_oficina_proveedor_abonos",
+    "status": "ok",
+    "rows": 0,
+    "ms": 85,
+    "code_refs": 1,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "logins",
+    "status": "ok",
+    "rows": 11367,
+    "ms": 225,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "movimientos_inventario",
+    "status": "ok",
+    "rows": 157990,
+    "ms": 869,
+    "code_refs": 12,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "nomina_lineas",
+    "status": "ok",
+    "rows": 202,
+    "ms": 100,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "nomina_periodos",
+    "status": "ok",
+    "rows": 15,
+    "ms": 104,
+    "code_refs": 9,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pagares",
+    "status": "ok",
+    "rows": 75,
+    "ms": 82,
+    "code_refs": 14,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_auditoria_eventos",
+    "status": "ok",
+    "rows": 19762,
+    "ms": 466,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_autorizacion_turno_fh",
+    "status": "ok",
+    "rows": 7,
+    "ms": 84,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_bonos_config",
+    "status": "ok",
+    "rows": 9,
+    "ms": 93,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_candado_post_liquidacion",
+    "status": "ok",
+    "rows": 1,
+    "ms": 85,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_config",
+    "status": "ok",
+    "rows": 1,
+    "ms": 100,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_contratacion_solicitudes",
+    "status": "ok",
+    "rows": 34,
+    "ms": 149,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_cubre_evaluaciones",
+    "status": "ok",
+    "rows": 88,
+    "ms": 90,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_cubre_solicitudes",
+    "status": "ok",
+    "rows": 151,
+    "ms": 78,
+    "code_refs": 19,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_departamentos_cedis",
+    "status": "ok",
+    "rows": 8,
+    "ms": 88,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_hora_limite_vale",
+    "status": "ok",
+    "rows": 1,
+    "ms": 75,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_incidencias",
+    "status": "ok",
+    "rows": 113,
+    "ms": 87,
+    "code_refs": 10,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_incidencias_catalogo",
+    "status": "ok",
+    "rows": 10,
+    "ms": 97,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_pin_cubre_turno",
+    "status": "ok",
+    "rows": 11,
+    "ms": 106,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_plan_horario",
+    "status": "ok",
+    "rows": 1,
+    "ms": 77,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_preinventario_plantillas",
+    "status": "ok",
+    "rows": 13,
+    "ms": 75,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_preinventario_sesiones",
+    "status": "ok",
+    "rows": 17,
+    "ms": 135,
+    "code_refs": 1,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_presencia_sucursal",
+    "status": "ok",
+    "rows": 9,
+    "ms": 113,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_privilegios",
+    "status": "ok",
+    "rows": 1,
+    "ms": 87,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_proveedores_ocultos_cedis",
+    "status": "ok",
+    "rows": 0,
+    "ms": 67,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "pos_push_subscriptions",
+    "status": "ok",
+    "rows": 0,
+    "ms": 122,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_resultados_inventario",
+    "status": "ok",
+    "rows": 65,
+    "ms": 241,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_solicitud_extension_turno",
+    "status": "ok",
+    "rows": 2,
+    "ms": 196,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "pos_turnos_config",
+    "status": "ok",
+    "rows": 9,
+    "ms": 83,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "pos_ventana_recoleccion",
+    "status": "ok",
+    "rows": 9,
+    "ms": 185,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "prestamos",
+    "status": "ok",
+    "rows": 8,
+    "ms": 137,
+    "code_refs": 33,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "prestamos_interarea",
+    "status": "ok",
+    "rows": 35,
+    "ms": 234,
+    "code_refs": 19,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "prestamos_sucursales",
+    "status": "ok",
+    "rows": 4,
+    "ms": 77,
+    "code_refs": 10,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "productos",
+    "status": "ok",
+    "rows": 2232,
+    "ms": 243,
+    "code_refs": 34,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "proveedor_catalogo",
+    "status": "ok",
+    "rows": 0,
+    "ms": 111,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "proveedor_entregas",
+    "status": "ok",
+    "rows": 350,
+    "ms": 158,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "proveedor_producto",
+    "status": "ok",
+    "rows": 2858,
+    "ms": 185,
+    "code_refs": 24,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "proveedores",
+    "status": "ok",
+    "rows": 58,
+    "ms": 174,
+    "code_refs": 21,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "r_virtual_custodia",
+    "status": "ok",
+    "rows": 30,
+    "ms": 364,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "repartidores",
+    "status": "ok",
+    "rows": 4,
+    "ms": 282,
+    "code_refs": 13,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rh_empleados",
+    "status": "ok",
+    "rows": 41,
+    "ms": 357,
+    "code_refs": 45,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rh_movimientos",
+    "status": "ok",
+    "rows": 178,
+    "ms": 310,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rh_recontratacion_pins",
+    "status": "ok",
+    "rows": 0,
+    "ms": 191,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rh_recontratacion_solicitudes",
+    "status": "ok",
+    "rows": 0,
+    "ms": 269,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rifs",
+    "status": "ok",
+    "rows": 0,
+    "ms": 159,
+    "code_refs": 18,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rt_cuentas",
+    "status": "ok",
+    "rows": 7,
+    "ms": 188,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "rt_movimientos_cuenta",
+    "status": "ok",
+    "rows": 73,
+    "ms": 359,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_camiones",
+    "status": "ok",
+    "rows": 3,
+    "ms": 135,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_cancelaciones",
+    "status": "ok",
+    "rows": 5,
+    "ms": 118,
+    "code_refs": 8,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_capital_solicitudes",
+    "status": "ok",
+    "rows": 0,
+    "ms": 108,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "ruta_carga_eventos",
+    "status": "ok",
+    "rows": 31,
+    "ms": 151,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_carga_lineas",
+    "status": "ok",
+    "rows": 23,
+    "ms": 99,
+    "code_refs": 17,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_cargas",
+    "status": "ok",
+    "rows": 2,
+    "ms": 114,
+    "code_refs": 9,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_clientes",
+    "status": "ok",
+    "rows": 0,
+    "ms": 85,
+    "code_refs": 3,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_cortes_caja",
+    "status": "ok",
+    "rows": 0,
+    "ms": 142,
+    "code_refs": 2,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_cxc_movimientos",
+    "status": "ok",
+    "rows": 208,
+    "ms": 100,
+    "code_refs": 28,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_efectivo_movimientos",
+    "status": "ok",
+    "rows": 0,
+    "ms": 82,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "ruta_fondo_movimientos",
+    "status": "ok",
+    "rows": 49,
+    "ms": 100,
+    "code_refs": 4,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_fondo_solicitudes",
+    "status": "ok",
+    "rows": 55,
+    "ms": 145,
+    "code_refs": 7,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_gastos_categorias",
+    "status": "ok",
+    "rows": 2,
+    "ms": 135,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ruta_liquidaciones",
+    "status": "ok",
+    "rows": 0,
+    "ms": 91,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "ruta_preinventario_sesiones",
+    "status": "ok",
+    "rows": 0,
+    "ms": 143,
+    "code_refs": 0,
+    "in_code": false,
+    "err": null
+  },
+  {
+    "table": "ruta_ventas",
+    "status": "ok",
+    "rows": 52,
+    "ms": 124,
+    "code_refs": 16,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "servicios_cobro",
+    "status": "ok",
+    "rows": 3,
+    "ms": 137,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "transito_efectivo",
+    "status": "ok",
+    "rows": 1376,
+    "ms": 123,
+    "code_refs": 59,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "usuarios",
+    "status": "ok",
+    "rows": 53,
+    "ms": 100,
+    "code_refs": 77,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "vales",
+    "status": "ok",
+    "rows": 285,
+    "ms": 99,
+    "code_refs": 19,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "vales_categorias",
+    "status": "ok",
+    "rows": 10,
+    "ms": 94,
+    "code_refs": 5,
+    "in_code": true,
+    "err": null
+  },
+  {
+    "table": "ventas",
+    "status": "ok",
+    "rows": 53631,
+    "ms": 789,
+    "code_refs": 6,
+    "in_code": true,
+    "err": null
+  }
+]
