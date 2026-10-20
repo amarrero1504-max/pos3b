@@ -43,8 +43,11 @@ Cuando el burst de disco se agota, PostgREST responde lento o con errores; el lo
 ### Ya en Supabase (dashboard)
 
 1. **Reports → Disk IO**: si está al 100%, esperar recarga diaria **o** subir a **Micro+**.
-2. SQL Editor → ejecutar `supabase/fix_disk_io_indexes.sql` (del repo canónico, PR #416).
-3. SQL Editor → ejecutar `supabase/diagnostico_disk_io.sql` y revisar seq scans / tablas grandes.
+2. SQL Editor → ejecutar `supabase/fix_disk_io_indexes.sql` (versión segura: **no falla** si falta alguna tabla).
+3. Si antes viste `42P01: relation "public.contabilidad_notificaciones" does not exist`:
+   - Usa la versión nueva de `fix_disk_io_indexes.sql` (salta tablas ausentes).
+   - O corre `supabase/check_tablas_indexes.sql` para ver si el SQL Editor está en otro proyecto/branch.
+4. SQL Editor → ejecutar `supabase/diagnostico_disk_io.sql` y revisar seq scans / tablas grandes.
 
 ### En el código (`aba3bs-arch/pos3b`)
 
