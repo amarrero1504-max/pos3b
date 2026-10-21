@@ -15,3 +15,9 @@ Veredicto: saturación de **Disk IO Budget** (no es fallo de `usuarios` ni de cr
 - `supabase/fix_disk_io_indexes.sql` — índices (seguro si falta alguna tabla)
 - `supabase/check_tablas_indexes.sql` — si falló con 42P01, verifica tablas/proyecto
 - `supabase/diagnostico_disk_io.sql` / `diagnostico_login_usuarios.sql`
+
+## Preinventario ruta = inv-op (2026-10-21)
+
+- `docs/PREINVENTARIO_RUTA_INV_OP.md`
+- `src/modules/Preinventario.jsx` (+ Ruta) — copiar al repo canónico
+- `patches/preinventario-ruta-inv-op/` — mismos archivos
