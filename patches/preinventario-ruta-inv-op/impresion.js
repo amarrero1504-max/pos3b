@@ -1,0 +1,816 @@
+import { etiquetaTienda } from '../constants/sucursales.js';
+import { leerLogoUrl, leerNombreNegocio, leerPieTicket } from './branding.js';
+import { enviarTextoSerial, puertoSerialConectado } from './perifericosPnP.js';
+import { impresionHabilitada, leerConfigImpresion } from './posConfig.js';
+
+function fmtFecha(d = new Date()) {
+  return d.toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' });
+}
+
+function fmtMoney(n) {
+  return `$${Number(n || 0).toFixed(2)}`;
+}
+
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function linea(cols) {
+  return `<tr>${cols.map((c) => `<td>${c}</td>`).join('')}</tr>`;
+}
+
+/** Medidas en mm para que el navegador no escale el ticket al doble. */
+export function medidasPapel(ancho = '80mm') {
+  const map = {
+    '58mm': { page: '58mm', body: '52mm', font: '11px', ventana: 230, margen: '1.5mm' },
+    '80mm': { page: '80mm', body: '72mm', font: '12px', ventana: 310, margen: '2mm' },
+    carta: { page: 'A4', body: '100%', font: '13px', ventana: 720, margen: '8mm' },
+  };
+  return map[ancho] || map['80mm'];
+}
+
+/**
+ * CSS común: tickets POS en negrita y máxima legibilidad (térmica / PDF).
+ * Úsalo en cualquier HTML de impresión del sistema.
+ */
+export function cssTicketPosLegible() {
+  return `
+    body, body *:not(#pdf-bar):not(#pdf-bar *) {
+      color: #000 !important;
+      font-weight: 800 !important;
+      -webkit-font-smoothing: none;
+      text-rendering: geometricPrecision;
+    }
+    .muted, .sub, .tag {
+      color: #000 !important;
+      font-weight: 800 !important;
+      opacity: 1 !important;
+    }
+    .sep { border-top: 2px solid #000 !important; }
+    strong, b, .bold, .total-line, h1, h2, th {
+      font-weight: 900 !important;
+    }
+  `;
+}
+
+export function estilosImpresion(ancho) {
+  const m = medidasPapel(ancho);
+  const esTicket = ancho === '58mm' || ancho === '80mm';
+  return `
+    @page { size: ${m.page} auto; margin: ${esTicket ? '1mm' : '6mm'}; }
+    html { width: ${m.body}; margin: 0 auto; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, Helvetica, 'Segoe UI', sans-serif;
+      font-size: ${m.font};
+      line-height: 1.35;
+      letter-spacing: 0.01em;
+      color: #000;
+      font-weight: 800;
+      margin: 0 auto;
+      padding: ${m.margen};
+      width: ${m.body};
+      max-width: ${m.body};
+    }
+    .center { text-align: center; }
+    .bold { font-weight: 900; }
+    .muted { color: #000; font-size: 0.95em; font-weight: 800; }
+    .sep { border-top: 2px solid #000; margin: 6px 0; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th { font-weight: 900; padding: 2px 0; text-align: left; border-bottom: 1.5px solid #000; }
+    td { padding: 2px 0; vertical-align: top; word-wrap: break-word; font-weight: 800; }
+    td.r { text-align: right; white-space: nowrap; }
+    h1 { font-size: 1.2em; margin: 0 0 3px; font-weight: 900; letter-spacing: 0.02em; }
+    h2 { font-size: 1.05em; margin: 0 0 5px; font-weight: 900; }
+    img.logo { max-width: 62%; max-height: 48px; display: block; margin: 0 auto 4px; }
+    .total-line { font-weight: 900; text-align: right; margin-top: 6px; font-size: 1.15em; }
+    #pdf-bar { position: sticky; top: 0; z-index: 9; background: #1a5276; color: #fff; padding: 8px; text-align: center; font-family: system-ui, sans-serif; font-size: 13px; font-weight: 700; }
+    #pdf-bar button { background: #fff; color: #1a5276; border: none; padding: 6px 14px; border-radius: 6px; font-weight: 700; cursor: pointer; margin: 0 4px; }
+    @media print {
+      html, body { width: ${m.body}; max-width: ${m.body}; margin: 0 auto; padding: ${m.margen}; }
+      body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      #pdf-bar { display: none !important; }
+    }
+    ${cssTicketPosLegible()}
+  `;
+}
+
+function cabeceraDoc(titulo, meta = {}) {
+  const negocio = esc(meta.negocio || leerNombreNegocio());
+  const logo = meta.logo !== false ? leerLogoUrl() : null;
+  const rows = [
+    meta.sucursal ? `Tienda: ${esc(etiquetaTienda(meta.sucursal))}` : '',
+    meta.fecha ? `Fecha: ${esc(meta.fecha)}` : `Fecha: ${esc(fmtFecha())}`,
+    meta.usuario ? `Usuario: ${esc(meta.usuario)}` : '',
+    meta.folio ? `Folio: ${esc(meta.folio)}` : '',
+  ].filter(Boolean);
+  return `
+    <div class="center">
+      ${logo ? `<img class="logo" src="${esc(logo)}" alt="" />` : ''}
+      <h1>${negocio}</h1>
+      <h2>${esc(titulo)}</h2>
+      ${rows.map((r) => `<div class="muted">${r}</div>`).join('')}
+    </div>
+    <div class="sep"></div>
+  `;
+}
+
+function pieDoc(extra) {
+  const pie = esc(leerPieTicket());
+  return `
+    <div class="sep"></div>
+    <div class="center muted">${pie}</div>
+    ${extra ? `<div class="muted" style="margin-top:6px">${extra}</div>` : ''}
+  `;
+}
+
+function htmlTablaLineas(lineas, cols) {
+  const head = cols.map((c) => `<th style="text-align:${c.align || 'left'};font-size:0.9em">${esc(c.label)}</th>`).join('');
+  const body = lineas
+    .map((row) =>
+      `<tr>${cols
+        .map((c) => `<td style="text-align:${c.align || 'left'}">${c.fmt ? c.fmt(row) : esc(row[c.key])}</td>`)
+        .join('')}</tr>`,
+    )
+    .join('');
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+/** Normaliza metodo_pago a efectivo | credito | mixto | ''. */
+export function normalizarMetodoPagoTicket(raw) {
+  const s = String(raw || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+  if (!s) return '';
+  if (s.includes('mixto')) return 'mixto';
+  if (s.includes('credito') || s.includes('crédito')) return 'credito';
+  if (s.includes('efectivo') || s === 'cash') return 'efectivo';
+  return s;
+}
+
+/**
+ * Bloque grande de tipo de pago para tickets (CREDITO / MIXTO / EFECTIVO).
+ * Usado en venta POS, venta en ruta y recepción de compras.
+ */
+export function htmlBloqueTipoPagoGrande(data = {}) {
+  const metodo = normalizarMetodoPagoTicket(data.metodo_pago || data.metodo);
+  const efe = Number(data.monto_efectivo ?? data.montoEfectivo);
+  const cre = Number(data.monto_credito ?? data.montoCredito);
+  const total = Number(data.total) || 0;
+  if (metodo === 'credito') {
+    return `
+      <div class="center" style="margin:8px 0 10px">
+        <div style="font-size:2.1em;font-weight:900;letter-spacing:0.08em;line-height:1">CREDITO</div>
+        <div class="bold" style="margin-top:4px;font-size:1.15em">${fmtMoney(Number.isFinite(cre) && cre > 0 ? cre : total)}</div>
+      </div>`;
+  }
+  if (metodo === 'mixto') {
+    const e = Number.isFinite(efe) ? efe : 0;
+    const c = Number.isFinite(cre) ? cre : 0;
+    const folioMe = data.folio_efectivo || data.folioEfectivo || '';
+    const folioMc = data.folio_credito || data.folioCredito || '';
+    return `
+      <div class="center" style="margin:6px 0 8px">
+        <div style="font-size:2em;font-weight:900;letter-spacing:0.06em;line-height:1">MIXTO</div>
+      </div>
+      <div class="bold">Desglose de pago</div>
+      <div>Efectivo: ${fmtMoney(e)}${folioMe ? ` · ${esc(folioMe)}` : ''}</div>
+      <div>Crédito: ${fmtMoney(c)}${folioMc ? ` · ${esc(folioMc)}` : ''}</div>
+      <div class="sep"></div>`;
+  }
+  if (metodo === 'efectivo') {
+    return `
+      <div class="center" style="margin:8px 0 10px">
+        <div style="font-size:2.1em;font-weight:900;letter-spacing:0.08em;line-height:1">EFECTIVO</div>
+        <div class="bold" style="margin-top:4px;font-size:1.15em">${fmtMoney(Number.isFinite(efe) && efe > 0 ? efe : total)}</div>
+      </div>`;
+  }
+  if (data.metodo_pago) {
+    return `<div class="muted" style="margin-bottom:4px">Pago: ${esc(data.metodo_pago)}</div>`;
+  }
+  return '';
+}
+
+export function htmlTicketVenta(data) {
+  const cfg = leerConfigImpresion();
+  const items = (data.articulos || []).filter((it) => it && !it._pago_mixto);
+  const filas = items
+    .map(
+      (it) =>
+        linea([
+          `<span>${esc(it.nombre)}</span>`,
+          `<span class="r">${it.qty || it.cantidad || 1} × ${fmtMoney(it.precio)}</span>`,
+          `<span class="r bold">${fmtMoney(Number(it.precio) * (it.qty || it.cantidad || 1))}</span>`,
+        ]),
+    )
+    .join('');
+  const metodo = normalizarMetodoPagoTicket(data.metodo_pago || data.metodo);
+  const titulo =
+    metodo === 'credito' ? 'TICKET · CREDITO'
+      : metodo === 'mixto' ? 'TICKET · MIXTO'
+        : metodo === 'efectivo' ? 'TICKET · EFECTIVO'
+          : (data.tituloTicket || 'TICKET DE VENTA');
+  const cambio =
+    data.cambio != null && (data.esEfectivo || metodo === 'efectivo')
+      ? `<div>Recibido: ${fmtMoney(data.recibido)} ${esc(data.moneda || 'MXN')}</div><div class="bold">Cambio: ${fmtMoney(data.cambio)} MXN</div>`
+      : '';
+  const destino = data.destino || data.cliente_nombre || data.tienda
+    ? `<div class="bold">Destino: ${esc(data.destino || data.cliente_nombre || data.tienda)}</div>`
+    : '';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Ticket</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(titulo, { sucursal: data.sucursal, usuario: data.vendedor, fecha: data.fecha, folio: data.folio })}
+    ${htmlBloqueTipoPagoGrande(data)}
+    ${destino}
+    <table>${filas}</table>
+    <div class="sep"></div>
+    <div class="total-line">TOTAL ${fmtMoney(data.total)} MXN</div>
+    ${cambio}
+    ${pieDoc(data.pieExtra || '')}
+  </body></html>`;
+}
+
+export function htmlPedidoCompra(data) {
+  const cfg = leerConfigImpresion();
+  const lineas = (data.items || []).filter((l) => Number(l.qty_pedido || l.qty) > 0);
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Pedido</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc('ORDEN DE COMPRA', { sucursal: data.sucursal, usuario: data.usuario, folio: data.folio })}
+    <div class="bold">Proveedor: ${esc(data.proveedor)}</div>
+    ${data.notas ? `<div class="muted">Notas: ${esc(data.notas)}</div>` : ''}
+    <div class="sep"></div>
+    ${htmlTablaLineas(lineas, [
+      { label: 'Cód.', key: 'id' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Cant.', key: 'qty_pedido', align: 'right', fmt: (r) => r.qty_pedido ?? r.qty },
+      { label: 'Costo', key: 'costo_est', align: 'right', fmt: (r) => fmtMoney(r.costo_est || r.costo) },
+    ])}
+    <div class="sep"></div>
+    <div class="bold" style="text-align:right">Total estimado: ${fmtMoney(data.total)}</div>
+    ${pieDoc('Documento de pedido — no actualiza inventario hasta recepción.')}
+  </body></html>`;
+}
+
+export function htmlRecepcionCompra(data) {
+  const cfg = leerConfigImpresion();
+  const lineas = (data.items || []).filter((l) => Number(l.qty || l.qty_recibido) > 0);
+  const metodo = normalizarMetodoPagoTicket(data.metodo_pago || data.metodo);
+  const titulo =
+    metodo === 'credito' ? 'RECEPCIÓN · CREDITO'
+      : metodo === 'mixto' ? 'RECEPCIÓN · MIXTO'
+        : metodo === 'efectivo' ? 'RECEPCIÓN · EFECTIVO'
+          : 'RECEPCIÓN DE COMPRA';
+  const folioVisible = data.folioVenta || data.folio_venta || data.folio;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Recepción</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(titulo, { sucursal: data.sucursal, usuario: data.usuario, folio: folioVisible })}
+    ${htmlBloqueTipoPagoGrande(data)}
+    ${data.proveedor ? `<div class="bold">Proveedor: ${esc(data.proveedor)}</div>` : ''}
+    ${data.folioVenta || data.folio_venta ? `<div class="muted">Venta ruta: ${esc(data.folioVenta || data.folio_venta)}</div>` : ''}
+    <div class="sep"></div>
+    <div class="bold" style="margin-bottom:4px">Mercancía recibida</div>
+    ${htmlTablaLineas(lineas, [
+      { label: 'Cód.', key: 'id' },
+      {
+        label: 'Descripción',
+        key: 'nombre',
+        fmt: (r) => esc(r.nombre || r.descripcion || r.id || ''),
+      },
+      { label: 'Cant.', key: 'qty', align: 'right', fmt: (r) => r.qty ?? r.qty_recibido },
+      { label: 'Costo', key: 'costo', align: 'right', fmt: (r) => fmtMoney(r.costo || r.costo_est) },
+    ])}
+    <div class="sep"></div>
+    <div class="bold" style="text-align:right">Total ticket: ${fmtMoney(data.total)}</div>
+    ${pieDoc('Mercancía recibida — inventario actualizado.')}
+  </body></html>`;
+}
+
+export function htmlInventario(data) {
+  const cfg = leerConfigImpresion();
+  const rows = data.productos || [];
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Inventario</title><style>${estilosImpresion(cfg.ancho === '58mm' ? 'carta' : cfg.ancho)}</style></head><body>
+    ${cabeceraDoc('INVENTARIO / STOCK', { sucursal: data.sucursal, usuario: data.usuario })}
+    ${data.titulo ? `<div class="muted">${esc(data.titulo)}</div>` : ''}
+    <div class="sep"></div>
+    ${htmlTablaLineas(rows, [
+      { label: 'Código', key: 'id' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Stock', key: 'stock', align: 'right' },
+      { label: 'Precio', key: 'precio', align: 'right', fmt: (r) => fmtMoney(r.precio) },
+    ])}
+    <div class="sep"></div>
+    <div class="muted">Productos: ${rows.length}</div>
+    ${pieDoc()}
+  </body></html>`;
+}
+
+export function htmlMovimientoInventario(data) {
+  const cfg = leerConfigImpresion();
+  const lineas = data.lineas || [];
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Mov. inventario</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(data.titulo || 'MOVIMIENTO DE INVENTARIO', { sucursal: data.sucursal, usuario: data.usuario, folio: data.folio })}
+    ${data.motivo ? `<div class="muted">Motivo: ${esc(data.motivo)}</div>` : ''}
+    <div class="sep"></div>
+    ${htmlTablaLineas(lineas, [
+      { label: 'Cód.', key: 'id' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Cant.', key: 'cantidad', align: 'right' },
+      { label: 'Tipo', key: 'tipo' },
+    ])}
+    ${pieDoc()}
+  </body></html>`;
+}
+
+/** Ticket de aplicación de carga CEDIS → camión (aclaraciones). */
+export function htmlCargaCamion(data) {
+  const cfg = leerConfigImpresion();
+  const lineas = data.lineas || [];
+  const fechaTxt = data.fecha
+    ? (() => {
+      try {
+        return new Date(data.fecha).toLocaleString('es-MX', { dateStyle: 'short', timeStyle: 'short' });
+      } catch {
+        return String(data.fecha);
+      }
+    })()
+    : fmtFecha();
+  const modo = data.cargaCerradaPorVacia
+    ? 'Nueva carga (anterior cerrada · camión vacío)'
+    : data.reusada
+      ? 'Recarga · sumado a carga abierta'
+      : 'Nueva carga abierta';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Carga camión</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(data.titulo || 'CARGA AL CAMIÓN', {
+      sucursal: data.sucursal || 'CEDIS',
+      usuario: data.usuario,
+      folio: data.folio,
+      fecha: fechaTxt,
+    })}
+    ${data.cargaFolio ? `<div>Carga: <strong>${esc(data.cargaFolio)}</strong></div>` : ''}
+    ${data.camion ? `<div>Camión: <strong>${esc(data.camion)}</strong></div>` : ''}
+    ${data.vendedor ? `<div>Recolector: <strong>${esc(data.vendedor)}</strong></div>` : ''}
+    <div class="muted">${esc(modo)}</div>
+    <div class="sep"></div>
+    ${htmlTablaLineas(lineas, [
+      { label: 'Cód.', key: 'id' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Cant.', key: 'cantidad', align: 'right' },
+      { label: 'P.ruta', key: 'precio', align: 'right', fmt: (r) => fmtMoney(r.precio) },
+      { label: 'Imp.', key: 'importe', align: 'right', fmt: (r) => fmtMoney(r.importe != null ? r.importe : (Number(r.precio) || 0) * (Number(r.cantidad) || 0)) },
+    ])}
+    <div class="sep"></div>
+    <div>Piezas: <strong>${esc(data.piezas ?? lineas.reduce((s, l) => s + (Number(l.cantidad) || 0), 0))}</strong></div>
+    <div class="bold">Total: ${fmtMoney(data.total)}</div>
+    ${pieDoc('Comprobante de salida CEDIS → camión. Conservar para aclaraciones.')}
+  </body></html>`;
+}
+
+export function htmlAjusteInventario(data) {
+  const cfg = leerConfigImpresion();
+  const lineas = (data.lineas || []).filter((l) => l.diferencia !== 0 && l.contada != null);
+  const r = data.resumen || {};
+  const estado = data.aplicado ? 'APLICADO' : 'BORRADOR';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Ajuste inventario</title><style>${estilosImpresion(cfg.ancho === '58mm' ? 'carta' : cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(`AJUSTE DE INVENTARIO · ${estado}`, { sucursal: data.sucursal, usuario: data.usuario, folio: data.folio })}
+    ${data.departamento ? `<div class="muted">Departamento: ${esc(data.departamento)}</div>` : ''}
+    <div class="sep"></div>
+    <div>Faltante: <strong>${r.piezasFaltantes || 0} pzs</strong> · ${fmtMoney(r.valorFaltante)}</div>
+    <div>Sobrante: <strong>${r.piezasSobrantes || 0} pzs</strong> · ${fmtMoney(r.valorSobrante)}</div>
+    <div>Piezas contadas: ${r.piezasContadas || 0} · Sistema: ${r.piezasExistencia || 0}</div>
+    <div class="sep"></div>
+    ${lineas.length ? htmlTablaLineas(lineas, [
+      { label: 'Código', key: 'codigo' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Exist.', key: 'existencia', align: 'right' },
+      { label: 'Contada', key: 'contada', align: 'right' },
+      { label: 'Dif.', key: 'diferencia', align: 'right', fmt: (row) => (row.diferencia > 0 ? `+${row.diferencia}` : String(row.diferencia)) },
+      { label: 'Valor dif.', key: 'valorDiferencia', align: 'right', fmt: (row) => (row.valorDiferencia > 0 ? fmtMoney(row.valorDiferencia) : '—') },
+    ]) : '<div class="muted">Sin diferencias en productos contados.</div>'}
+    ${pieDoc('Documento de ajuste físico por departamento.')}
+  </body></html>`;
+}
+
+function lineasReporteInvOp(lineasRaw = []) {
+  return (lineasRaw || []).map((l) => ({
+    codigo: l.codigo || l.id,
+    nombre: l.nombre,
+    existencia: l.existencia != null ? l.existencia : l.teorico,
+    contada: l.contadaNum != null ? l.contadaNum : l.contado,
+    diferencia: l.diferencia,
+    valorDiferencia: l.valorDiferencia,
+  }));
+}
+
+function htmlCuerpoReporteConteo(opts = {}) {
+  const {
+    titulo,
+    sucursal,
+    usuario,
+    folio,
+    nombre,
+    departamento,
+    metaExtra = '',
+    lineasRaw = [],
+    resumen: r = {},
+    pie,
+  } = opts;
+  const lineas = lineasReporteInvOp(lineasRaw);
+  const piezasFalt = r.piezasFaltantes != null ? r.piezasFaltantes : r.faltante;
+  const piezasSobr = r.piezasSobrantes != null ? r.piezasSobrantes : r.sobrante;
+  const contados = r.totalSkus != null
+    ? `${(r.totalSkus || 0) - (r.skusPendientes || 0)}/${r.totalSkus || 0}`
+    : `${r.contados || 0}/${r.productos || 0}`;
+  const conDif = lineas.filter((l) => l.contada != null && Number(l.diferencia) !== 0);
+  const cfg = leerConfigImpresion();
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>${esc(titulo)}</title><style>${estilosImpresion(cfg.ancho === '58mm' ? 'carta' : cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(titulo, { sucursal, usuario, folio })}
+    ${nombre ? `<div class="bold">${esc(nombre)}</div>` : ''}
+    ${departamento ? `<div class="muted">Departamento: ${esc(departamento)}</div>` : ''}
+    ${metaExtra}
+    <div class="sep"></div>
+    <div>Artículos contados: <strong>${contados}</strong></div>
+    <div>Faltante: <strong>${piezasFalt || 0} pzs</strong>${r.valorFaltante != null ? ` · ${fmtMoney(r.valorFaltante)}` : ''}</div>
+    <div>Sobrante: <strong>${piezasSobr || 0} pzs</strong>${r.valorSobrante != null ? ` · ${fmtMoney(r.valorSobrante)}` : ''}</div>
+    ${r.perdidaCosto != null ? `<div>Pérdida a costo: <strong>${fmtMoney(r.perdidaCosto)}</strong></div>` : ''}
+    ${r.perdidaPublico != null ? `<div>Pérdida a público: <strong>${fmtMoney(r.perdidaPublico)}</strong></div>` : ''}
+    ${r.piezasContadas != null ? `<div>Piezas contadas: ${r.piezasContadas || 0} · En existencia: ${r.piezasExistencia || 0}</div>` : ''}
+    <div class="sep"></div>
+    ${conDif.length ? htmlTablaLineas(conDif, [
+      { label: 'Código', key: 'codigo' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Exist.', key: 'existencia', align: 'right' },
+      { label: 'Contada', key: 'contada', align: 'right' },
+      { label: 'Dif.', key: 'diferencia', align: 'right', fmt: (row) => (row.diferencia > 0 ? `+${row.diferencia}` : String(row.diferencia)) },
+      { label: 'Valor dif.', key: 'valorDiferencia', align: 'right', fmt: (row) => (row.valorDiferencia > 0 ? fmtMoney(row.valorDiferencia) : '—') },
+    ]) : htmlTablaLineas(lineas, [
+      { label: 'Código', key: 'codigo' },
+      { label: 'Producto', key: 'nombre' },
+      { label: 'Exist.', key: 'existencia', align: 'right' },
+      { label: 'Contada', key: 'contada', align: 'right', fmt: (row) => (row.contada == null ? '—' : row.contada) },
+      { label: 'Dif.', key: 'diferencia', align: 'right', fmt: (row) => (row.diferencia == null ? '—' : row.diferencia > 0 ? `+${row.diferencia}` : String(row.diferencia)) },
+    ])}
+    ${pieDoc(pie)}
+  </body></html>`;
+}
+
+export function htmlPreinventario(data) {
+  return htmlCuerpoReporteConteo({
+    titulo: 'PREINVENTARIO · REPORTE (NO AFECTA TEÓRICO)',
+    sucursal: data.sucursal,
+    usuario: data.usuario,
+    folio: data.folio,
+    nombre: data.nombre,
+    departamento: data.departamento,
+    lineasRaw: data.lineas || [],
+    resumen: data.resumen || {},
+    pie: 'Solo control interno / camión. No modifica el inventario teórico del sistema.',
+  });
+}
+
+/** Ticket de Inv-op / Auditoría de camión (mismo formato que sucursales). */
+export function htmlAuditoriaCamion(data) {
+  const meta = [
+    data.recolector ? `<div>Recolector: <strong>${esc(data.recolector)}</strong></div>` : '',
+    data.camion ? `<div>Camión: <strong>${esc(data.camion)}</strong></div>` : '',
+  ].join('');
+  return htmlCuerpoReporteConteo({
+    titulo: 'INV-OP RUTA · AUDITORÍA (NO AFECTA TEÓRICO)',
+    sucursal: data.sucursal || 'RUTA',
+    usuario: data.usuario,
+    folio: data.folio,
+    nombre: data.nombre,
+    departamento: data.departamento,
+    metaExtra: meta,
+    lineasRaw: data.lineas || [],
+    resumen: data.resumen || {},
+    pie: 'Auditoría de mercancía en camión. No modifica el inventario del sistema.',
+  });
+}
+
+export function htmlReporte(data) {
+  const cfg = leerConfigImpresion();
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Reporte</title><style>${estilosImpresion(cfg.ancho === '58mm' ? 'carta' : cfg.ancho)}</style></head><body>
+    ${cabeceraDoc(data.titulo || 'REPORTE', { sucursal: data.sucursal, usuario: data.usuario, fecha: data.rango })}
+  ${data.secciones
+    ?.map(
+      (s) => `
+    <div class="bold" style="margin-top:8px">${esc(s.titulo)}</div>
+    ${s.html || (s.lineas ? `<pre style="margin:4px 0;white-space:pre-wrap">${esc(s.lineas.join('\n'))}</pre>` : '')}
+  `,
+    )
+    .join('') || ''}
+    ${data.tabla ? htmlTablaLineas(data.tabla.rows, data.tabla.cols) : ''}
+    ${pieDoc()}
+  </body></html>`;
+}
+
+export function htmlCorteCaja(data) {
+  const cfg = leerConfigImpresion();
+  const metodos = (data.detalleMetodos || [])
+    .map((d) => `<div>${esc(d.metodo)}: <span class="r">${fmtMoney(d.monto)}</span></div>`)
+    .join('');
+  const tiendas = (data.detalleTiendas || [])
+    .map((t) => {
+      const nom = esc(t.tienda || t.nombre || '—');
+      const parts = [
+        `${t.tickets || 0} tkt`,
+        fmtMoney(t.total),
+      ];
+      if (Number(t.efectivo) > 0) parts.push(`efe ${fmtMoney(t.efectivo)}`);
+      if (Number(t.credito) > 0) parts.push(`créd ${fmtMoney(t.credito)}`);
+      return `<div>${nom}: <span class="r">${parts.join(' · ')}</span></div>`;
+    })
+    .join('');
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Corte</title><style>${estilosImpresion(cfg.ancho)}</style></head><body>
+    ${cabeceraDoc('CORTE DE CAJA', { sucursal: data.sucursal, usuario: data.usuario, fecha: data.fecha })}
+    <div>Turno: <strong>${esc(data.turno)}</strong></div>
+    <div class="sep"></div>
+    <div>Tickets: ${data.tickets}</div>
+    <div>Cancelaciones: ${data.cancelaciones}</div>
+    <div>Ventas brutas: ${fmtMoney(data.totalBruto)}</div>
+    <div>Cancelado: -${fmtMoney(data.totalCancelaciones)}</div>
+    <div class="bold">Total neto: ${fmtMoney(data.total)}</div>
+    <div class="sep"></div>
+    <div class="bold">Por método de pago</div>
+    ${metodos || '<div class="muted">Sin movimientos</div>'}
+    ${
+      tiendas
+        ? `<div class="sep"></div><div class="bold">Por tienda / cliente</div>${tiendas}`
+        : ''
+    }
+    <div class="sep"></div>
+    <div>Efectivo esperado: ${fmtMoney(data.efectivoEsperado)}</div>
+    ${data.efectivoContado != null ? `<div>Efectivo contado: ${fmtMoney(data.efectivoContado)}</div>` : ''}
+    ${data.diferencia != null ? `<div class="bold">Diferencia efectivo: ${fmtMoney(data.diferencia)}</div>` : ''}
+    ${
+      data.corroboracion && Object.keys(data.corroboracion).length
+        ? `<div class="sep"></div><div class="bold">Corroboración rubros</div>${Object.entries(data.corroboracion)
+            .map(([k, v]) => {
+              if (!v || v.contado == null) return '';
+              const lbl = { tarjeta: 'Tarjeta', transferencia: 'Transferencia', qr: 'QR' }[k] || k;
+              return `<div>${lbl}: esp. ${fmtMoney(v.esperado)} · cont. ${fmtMoney(v.contado)} · dif. ${fmtMoney(v.diferencia)}</div>`;
+            })
+            .join('')}`
+        : ''
+    }
+    ${data.notas ? `<div class="muted">Notas: ${esc(data.notas)}</div>` : ''}
+    ${pieDoc()}
+  </body></html>`;
+}
+
+const GENERADORES = {
+  venta: htmlTicketVenta,
+  pedido_compra: htmlPedidoCompra,
+  recepcion_compra: htmlRecepcionCompra,
+  inventario: htmlInventario,
+  movimiento_inventario: htmlMovimientoInventario,
+  carga_camion: htmlCargaCamion,
+  ajuste_inventario: htmlAjusteInventario,
+  preinventario: htmlPreinventario,
+  auditoria_camion: htmlAuditoriaCamion,
+  reporte: htmlReporte,
+  corte: htmlCorteCaja,
+};
+
+function htmlATextoPlano(html) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html.replace(/<br\s*\/?>/gi, '\n').replace(/<\/tr>/gi, '\n').replace(/<\/div>/gi, '\n');
+  return tmp.textContent || tmp.innerText || '';
+}
+
+export function abrirVentanaImpresion(html, titulo = 'Imprimir', opts = {}) {
+  const cfg = leerConfigImpresion();
+  const ancho = opts.ancho || cfg.ancho;
+  const m = medidasPapel(ancho);
+  const w = window.open('', '_blank', `width=${m.ventana},height=640,scrollbars=yes`);
+  if (!w) return { ok: false, error: 'Permite ventanas emergentes para imprimir.' };
+
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+  w.document.title = titulo;
+  try {
+    w.focus();
+  } catch {
+    /* ignore */
+  }
+
+  if (opts.autoPrint === false) return { ok: true };
+
+  let impreso = false;
+  let preparando = false;
+  const dispararPrint = () => {
+    if (impreso) return;
+    impreso = true;
+    try {
+      w.focus();
+      w.print();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const cuandoListo = () => {
+    if (preparando || impreso) return;
+    preparando = true;
+    const imgs = Array.from(w.document.images || []);
+    const pendientes = imgs.filter((img) => !img.complete);
+    if (!pendientes.length) {
+      // Un frame extra evita el fallo de la 1ª impresión en Chrome/Edge.
+      if (typeof w.requestAnimationFrame === 'function') {
+        w.requestAnimationFrame(() => setTimeout(dispararPrint, 80));
+      } else {
+        setTimeout(dispararPrint, 80);
+      }
+      return;
+    }
+    let restantes = pendientes.length;
+    const unoListo = () => {
+      restantes -= 1;
+      if (restantes <= 0) setTimeout(dispararPrint, 80);
+    };
+    pendientes.forEach((img) => {
+      img.addEventListener('load', unoListo, { once: true });
+      img.addEventListener('error', unoListo, { once: true });
+    });
+  };
+
+  if (w.document.readyState === 'complete') {
+    cuandoListo();
+  } else {
+    w.addEventListener('load', cuandoListo, { once: true });
+    // Fallback si el evento load no llega (document.write en algunos navegadores).
+    setTimeout(cuandoListo, 300);
+  }
+  // Tope de seguridad: nunca dejar la ventana sin diálogo de impresión.
+  setTimeout(dispararPrint, 2500);
+
+  return { ok: true };
+}
+
+/** Vista previa con botón para guardar como PDF (diálogo de impresión del sistema). */
+export function abrirVentanaPDF(html, titulo = 'Guardar PDF') {
+  const cfg = leerConfigImpresion();
+  const m = medidasPapel(cfg.ancho);
+  const barra = `<div id="pdf-bar">
+    <span style="margin-right:8px">Vista previa</span>
+    <button type="button" onclick="window.print()">Guardar PDF / Imprimir</button>
+    <button type="button" onclick="window.close()">Cerrar</button>
+  </div>`;
+  const conBarra = html.replace(/<body([^>]*)>/i, `<body$1>${barra}`);
+  const w = window.open('', '_blank', `width=${Math.max(m.ventana, 360)},height=720,scrollbars=yes`);
+  if (!w) return { ok: false, error: 'Permite ventanas emergentes para exportar PDF.' };
+  w.document.write(conBarra);
+  w.document.close();
+  w.document.title = titulo;
+  w.focus();
+  return { ok: true };
+}
+
+export async function imprimirDocumento(tipo, datos, opts = {}) {
+  if (!impresionHabilitada(tipo) && !opts.forzar) {
+    return { ok: false, error: `Impresión de "${tipo}" desactivada en Configuración.` };
+  }
+  const gen = GENERADORES[tipo];
+  if (!gen) return { ok: false, error: `Tipo de documento desconocido: ${tipo}` };
+  const html = gen(datos);
+  const cfg = leerConfigImpresion();
+
+  if (opts.soloSerial && puertoSerialConectado()) {
+    const texto = htmlATextoPlano(html);
+    return enviarTextoSerial(texto);
+  }
+
+  if (puertoSerialConectado() && cfg.impresoraId && !opts.soloNavegador) {
+    const texto = htmlATextoPlano(html);
+    const r = await enviarTextoSerial(texto);
+    if (r.ok) return r;
+  }
+
+  const copias = Math.max(1, Number(opts.copias || cfg.copias) || 1);
+  for (let i = 0; i < copias; i++) {
+    const r = abrirVentanaImpresion(html, opts.titulo || tipo);
+    if (!r.ok) return r;
+  }
+  return { ok: true };
+}
+
+export function imprimirVenta(datos, opts = {}) {
+  return entregarTicketVenta(datos, opts.modo || 'imprimir', opts);
+}
+
+/** Imprime, abre PDF o no hace nada según el modo elegido. */
+export async function entregarTicketVenta(datos, modo = 'imprimir', opts = {}) {
+  if (modo === 'ninguno') return { ok: true, omitido: true };
+  const payload = { fecha: fmtFecha(), ...datos };
+  if (modo === 'pdf') {
+    const html = htmlTicketVenta(payload);
+    return abrirVentanaPDF(html, opts.titulo || 'Ticket de venta');
+  }
+  return imprimirDocumento('venta', payload, { ...opts, titulo: opts.titulo || 'Ticket de venta' });
+}
+
+export function exportarVentaPDF(datos) {
+  return entregarTicketVenta(datos, 'pdf');
+}
+
+export function imprimirPedidoCompra(datos, opts = {}) {
+  return imprimirDocumento('pedido_compra', datos, { forzar: true, ...opts });
+}
+
+export function imprimirRecepcionCompra(datos, opts = {}) {
+  return imprimirDocumento('recepcion_compra', datos, { forzar: true, ...opts });
+}
+
+export function imprimirInventario(datos) {
+  return imprimirDocumento('inventario', datos);
+}
+
+export function imprimirMovimientoInventario(datos) {
+  return imprimirDocumento('movimiento_inventario', datos);
+}
+
+/** Ticket de carga al camión (siempre forzado: comprobante operativo). */
+export function imprimirCargaCamion(datos, opts = {}) {
+  return imprimirDocumento('carga_camion', datos, {
+    forzar: true,
+    titulo: opts.titulo || 'Carga al camión',
+    ...opts,
+  });
+}
+
+export function imprimirAjusteInventario(datos) {
+  return imprimirDocumento('ajuste_inventario', datos, { forzar: true });
+}
+
+export function imprimirPreinventario(datos) {
+  return imprimirDocumento('preinventario', datos, { forzar: true, titulo: 'Preinventario' });
+}
+
+export function imprimirAuditoriaCamion(datos) {
+  return imprimirDocumento('auditoria_camion', datos, { forzar: true, titulo: 'Inv-op ruta · Auditoría' });
+}
+
+export function imprimirReporte(datos) {
+  return imprimirDocumento('reporte', datos);
+}
+
+export function imprimirCorte(datos, opts = {}) {
+  return imprimirDocumento('corte', datos, { forzar: true, ...opts, titulo: opts.titulo || 'Corte de caja' });
+}
+
+export function imprimirPrueba() {
+  return imprimirDocumento(
+    'venta',
+    {
+      sucursal: 'MAIN',
+      vendedor: 'Prueba',
+      articulos: [
+        { nombre: 'Producto de ejemplo', precio: 15.5, qty: 2 },
+        { nombre: 'Refresco 600ml', precio: 18, qty: 1 },
+      ],
+      total: 49,
+      metodo_pago: 'Efectivo MXN',
+      esEfectivo: true,
+      recibido: 100,
+      cambio: 51,
+      moneda: 'MXN',
+    },
+    { forzar: true, titulo: 'Ticket de prueba' },
+  );
+}
+
+function htmlEtiquetasEstante(productos, meta = {}) {
+  const cfg = leerConfigImpresion();
+  const ancho = cfg.ancho === '58mm' ? '58mm' : '80mm';
+  const items = (productos || []).map(
+    (p) => `
+    <div class="etiqueta" style="border:2px solid #000;padding:8px;margin:6px;display:inline-block;width:calc(50% - 12px);min-width:140px;vertical-align:top;page-break-inside:avoid">
+      <div style="font-size:0.8rem;font-weight:800">${esc(meta.sucursal ? etiquetaTienda(meta.sucursal) : '')}</div>
+      <div style="font-weight:900;font-size:1.05rem;line-height:1.25;margin:4px 0">${esc(p.nombre)}</div>
+      <div style="font-size:1.45rem;font-weight:900">${fmtMoney(p.precio)}</div>
+      <div style="font-family:monospace;font-size:0.95rem;margin-top:4px;font-weight:800">${esc(p.id)}</div>
+      <div style="font-size:0.9rem;margin-top:2px;font-weight:800">Stock piso: ${p.stock ?? 0}</div>
+    </div>`,
+  );
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Etiquetas</title>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;margin:12px;color:#000;font-weight:800}
+      body,body *{color:#000!important;font-weight:800!important}
+      h3{font-weight:900;font-size:1.15rem}
+      .etiqueta{border:2px solid #000!important}
+      @media print{.etiqueta{border-color:#000}}
+      ${cssTicketPosLegible()}
+    </style></head>
+    <body>
+    <h3 style="margin:0 0 8px">Etiquetas de estante</h3>
+    <div class="muted" style="font-size:0.9rem;margin-bottom:12px">${items.length} producto(s) · ${fmtFecha()}</div>
+    ${items.join('') || '<p>Sin productos.</p>'}
+    </body></html>`;
+}
+
+export function imprimirEtiquetasEstante(productos, meta = {}) {
+  const html = htmlEtiquetasEstante(productos, meta);
+  return abrirVentanaImpresion(html, 'Etiquetas de estante');
+}
