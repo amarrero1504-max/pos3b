@@ -23,7 +23,10 @@ const {
   tieneAutorizacionFueraHorario,
   revocarAutorizacionFueraHorario,
   AVISO_CUOTA_AUTORIZACION_LOCAL,
+  __resetMemoriaAutorizacionTurnoFhParaTests,
 } = await import('./autorizacionTurnoFueraHorario.js');
+
+__resetMemoriaAutorizacionTurnoFhParaTests();
 
 assert.equal(rolPuedeAutorizarFueraHorario('Administrador'), true);
 assert.equal(rolPuedeAutorizarFueraHorario('administrador'), true);
@@ -52,7 +55,7 @@ assert.equal(tieneAutorizacionFueraHorario(user, 'FUSION'), false);
 revocarAutorizacionFueraHorario(user.id, suc);
 assert.equal(tieneAutorizacionFueraHorario(user, suc), false);
 
-// Quota llena: no debe tumbar la autorización (nube sigue siendo la fuente de verdad).
+// Quota llena: NO tumba la autorización; memoria + nube siguen vigentes.
 failQuota = true;
 mem.set('pos3b_movimientos_inventario_pesado', 'x'.repeat(1000));
 let upsertOk = false;
@@ -75,6 +78,11 @@ const entryQuota = await otorgarAutorizacionFueraHorario({
 });
 assert.ok(entryQuota, 'debe devolver entry aunque falle localStorage');
 assert.equal(upsertOk, true, 'debe guardar en nube aunque falle local');
+assert.equal(
+  tieneAutorizacionFueraHorario(user, suc),
+  true,
+  'memoria debe autorizar aunque localStorage esté lleno',
+);
 assert.ok(
   entryQuota.avisoLocal === AVISO_CUOTA_AUTORIZACION_LOCAL
     || /lleno|cuota|almacenamiento/i.test(String(entryQuota.avisoLocal || '')),
