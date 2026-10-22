@@ -6,14 +6,20 @@ import { usuarioEstaActivo } from './usuariosAuth.js';
 export const LS_AUTORIZACION_TURNO_FH = 'pos3b_autorizacion_turno_fh';
 export const DURACION_AUTORIZACION_TURNO_MS = 8 * 60 * 60 * 1000;
 /** Tope de autorizaciones vigentes en este equipo (evita QuotaExceeded). */
-const MAX_AUTORIZACIONES_LOCAL = 60;
-const MAX_AUTORIZACIONES_EMERGENCIA = 8;
+const MAX_AUTORIZACIONES_LOCAL = 40;
+const MAX_AUTORIZACIONES_EMERGENCIA = 5;
 
 export const AVISO_FALTA_AUTORIZACION_TURNO_FH =
   'Ejecuta supabase/fix_autorizacion_turno_fuera_horario.sql para autorizar entrada fuera de horario desde el panel admin (nube).';
 
 export const AVISO_CUOTA_AUTORIZACION_LOCAL =
   'Almacenamiento del celular lleno: la autorización quedó en la nube; el empleado ya puede entrar. Limpia caché del POS si el aviso se repite.';
+
+/**
+ * Caché en memoria (sesión actual). Si localStorage está lleno, igual
+ * sirve para autorizar login en este dispositivo sin tumbar la aprobación.
+ */
+const memoriaAuth = new Map(); // clave → entry
 
 /** Roles que pueden autorizar entrada fuera de horario (login / checador). */
 export function rolPuedeAutorizarFueraHorario(rol) {
@@ -26,7 +32,7 @@ function claveAutorizacion(usuarioId, sucursal) {
 }
 
 function limpiarExpiradas(lista, ahora = Date.now()) {
-  return (lista || []).filter((a) => a.expiraEn > ahora);
+  return (lista || []).filter((a) => Number(a?.expiraEn) > ahora);
 }
 
 function esErrorCuota(err) {
@@ -64,9 +70,8 @@ function liberarEspacioTemporalLocal() {
       if (clave.startsWith('pos3b_turnos_caja')) continue;
       if (clave.startsWith('pos3b_carrito_')) continue;
       if (clave.startsWith('pos3b_resultado_inv_')) continue;
-      // Preferir borrar historiales / auditoría / movimientos / reportes locales.
       if (
-        /movim|auditor|historial|reporte|correccion|ajuste|ruta_auditor|offline|cache|favoritos/i.test(clave)
+        /movim|auditor|historial|reporte|correccion|ajuste|ruta_auditor|offline|cache|favoritos|buffer/i.test(clave)
         || clave.includes('_espera')
         || clave.includes('consolid')
       ) {
@@ -116,33 +121,69 @@ function faltaTablaAuthFh(error) {
   );
 }
 
-export function leerAutorizacionesTurnoFueraHorario() {
+function actualizarMemoria(lista) {
+  const ahora = Date.now();
+  for (const [k, v] of [...memoriaAuth.entries()]) {
+    if (!v || Number(v.expiraEn) <= ahora) memoriaAuth.delete(k);
+  }
+  for (const a of limpiarExpiradas(lista, ahora)) {
+    const e = slimAuthEntry(a);
+    if (e.clave) memoriaAuth.set(e.clave, e);
+  }
+}
+
+function leerSoloLocalStorage() {
   try {
+    if (typeof localStorage === 'undefined') return [];
     const raw = localStorage.getItem(LS_AUTORIZACION_TURNO_FH);
     if (!raw) return [];
     const list = JSON.parse(raw);
-    if (!Array.isArray(list)) return [];
-    const vigentes = limpiarExpiradas(list);
-    if (vigentes.length !== list.length) {
-      try {
-        localStorage.setItem(LS_AUTORIZACION_TURNO_FH, JSON.stringify(podarAutorizaciones(vigentes)));
-      } catch {
-        /* si no cabe el prune, igual devolvemos vigentes en memoria */
-      }
-    }
-    return vigentes;
+    return Array.isArray(list) ? limpiarExpiradas(list) : [];
   } catch {
     return [];
   }
 }
 
+export function leerAutorizacionesTurnoFueraHorario() {
+  const ahora = Date.now();
+  const fromLs = leerSoloLocalStorage();
+  const fromMem = [...memoriaAuth.values()].filter((a) => Number(a?.expiraEn) > ahora);
+  const map = new Map();
+  for (const a of fromLs) {
+    const e = slimAuthEntry(a);
+    if (e.clave) map.set(e.clave, e);
+  }
+  for (const a of fromMem) {
+    const e = slimAuthEntry(a);
+    if (e.clave) map.set(e.clave, e);
+  }
+  const merged = [...map.values()];
+  if (fromLs.length && fromLs.length !== merged.length) {
+    // Intentar podar LS sin tumbar lectura
+    try {
+      localStorage.setItem(LS_AUTORIZACION_TURNO_FH, JSON.stringify(podarAutorizaciones(fromLs)));
+    } catch {
+      /* ignore */
+    }
+  }
+  return merged;
+}
+
 /**
- * Persiste autorizaciones locales sin tumbar la aprobación si el storage está lleno.
+ * Persiste autorizaciones: siempre actualiza memoria; localStorage es best-effort.
+ * NUNCA lanza (ni QuotaExceeded).
  * @returns {{ ok: boolean, aviso?: string }}
  */
 function escribirAutorizacionesLocal(lista) {
+  const podadas = podarAutorizaciones(lista, MAX_AUTORIZACIONES_LOCAL);
+  actualizarMemoria(podadas);
+
+  if (typeof localStorage === 'undefined') {
+    return { ok: true, aviso: undefined };
+  }
+
   const intentos = [
-    podarAutorizaciones(lista, MAX_AUTORIZACIONES_LOCAL),
+    podadas,
     podarAutorizaciones(lista, MAX_AUTORIZACIONES_EMERGENCIA),
     podarAutorizaciones(lista, 1),
   ];
@@ -158,26 +199,30 @@ function escribirAutorizacionesLocal(lista) {
       };
     } catch (err) {
       if (!esErrorCuota(err)) {
-        return { ok: false, aviso: err?.message || String(err) };
+        // Memoria ya quedó; no tumbar flujo.
+        return { ok: true, aviso: AVISO_CUOTA_AUTORIZACION_LOCAL };
       }
       if (i === 0) liberarEspacioTemporalLocal();
     }
   }
 
-  // Último recurso: no bloquear la autorización en nube.
-  return { ok: false, aviso: AVISO_CUOTA_AUTORIZACION_LOCAL };
+  // Memoria vigente → el login de esta sesión sigue funcionando.
+  return { ok: true, aviso: AVISO_CUOTA_AUTORIZACION_LOCAL };
 }
 
 export function tieneAutorizacionFueraHorario(user, sucursal, date = new Date()) {
   if (!user?.id || !sucursal) return false;
   const clave = claveAutorizacion(user.id, sucursal);
   const ahora = date.getTime();
+  const mem = memoriaAuth.get(clave);
+  if (mem && Number(mem.expiraEn) > ahora) return true;
   return leerAutorizacionesTurnoFueraHorario().some((a) => a.clave === clave && a.expiraEn > ahora);
 }
 
 /**
- * Otorga autorización local (+ nube si hay supabase).
+ * Otorga autorización en nube (fuente de verdad) + caché local/memoria best-effort.
  * Duración por defecto 8 h; el overlay de solicitud puede pasar 2–12 h.
+ * Nunca falla por QuotaExceeded de localStorage.
  */
 export async function otorgarAutorizacionFueraHorario({
   usuarioId,
@@ -199,11 +244,10 @@ export async function otorgarAutorizacionFueraHorario({
     otorgadoEn: ahora,
     expiraEn,
   };
-  const next = [...leerAutorizacionesTurnoFueraHorario().filter((a) => a.clave !== entry.clave), entry];
 
-  // Primero nube (fuente de verdad para el login del empleado).
-  // El local del celular del admin puede estar lleno (QuotaExceeded) y NO debe abortar.
+  // 1) Nube primero — es lo que usa el empleado al sincronizar en login.
   let avisoNube = null;
+  let nubeOk = !supabase;
   if (supabase) {
     const row = {
       usuario_id: String(usuarioId),
@@ -213,23 +257,42 @@ export async function otorgarAutorizacionFueraHorario({
       otorgado_en: new Date(ahora).toISOString(),
       expira_en: new Date(expiraEn).toISOString(),
     };
-    const { error } = await supabase
-      .from('pos_autorizacion_turno_fh')
-      .upsert(row, { onConflict: 'usuario_id,sucursal_id' });
-    if (error && !faltaTablaAuthFh(error)) {
-      console.warn('autorizacion turno FH nube:', error.message);
-      avisoNube = error.message;
+    try {
+      const { error } = await supabase
+        .from('pos_autorizacion_turno_fh')
+        .upsert(row, { onConflict: 'usuario_id,sucursal_id' });
+      if (error && !faltaTablaAuthFh(error)) {
+        console.warn('autorizacion turno FH nube:', error.message);
+        avisoNube = error.message;
+        nubeOk = false;
+      } else {
+        nubeOk = true;
+        if (error && faltaTablaAuthFh(error)) {
+          avisoNube = AVISO_FALTA_AUTORIZACION_TURNO_FH;
+        }
+      }
+    } catch (err) {
+      avisoNube = err?.message || String(err);
+      nubeOk = false;
     }
   }
 
+  // 2) Memoria + local best-effort (nunca lanza).
+  const next = [...leerAutorizacionesTurnoFueraHorario().filter((a) => a.clave !== entry.clave), entry];
   const local = escribirAutorizacionesLocal(next);
   if (local.aviso) entry.avisoLocal = local.aviso;
   if (avisoNube) entry.avisoNube = avisoNube;
+
+  // Sin nube y sin poder persistir: igual devolvemos entry (memoria ya tiene la auth).
+  if (!nubeOk && !supabase) {
+    return entry;
+  }
   return entry;
 }
 
 export function revocarAutorizacionFueraHorario(usuarioId, sucursal) {
   const clave = claveAutorizacion(usuarioId, sucursal);
+  memoriaAuth.delete(clave);
   const next = leerAutorizacionesTurnoFueraHorario().filter((a) => a.clave !== clave);
   escribirAutorizacionesLocal(next);
 }
@@ -252,7 +315,8 @@ export async function revocarAutorizacionFueraHorarioNube(supabase, usuarioId, s
 }
 
 /**
- * Trae autorización vigente de la nube al local (antes de validar login).
+ * Trae autorización vigente de la nube al local/memoria (antes de validar login).
+ * Si localStorage está lleno, igual marca vigente vía memoria.
  */
 export async function sincronizarAutorizacionFueraHorarioDesdeNube(supabase, usuarioId, sucursal) {
   if (!supabase || !usuarioId || !sucursal) return { ok: true, vigente: false };
@@ -369,4 +433,9 @@ export function etiquetaAutorizacionActiva(user, sucursal) {
   const mins = Math.floor((restante % (60 * 60 * 1000)) / (60 * 1000));
   const vigencia = horas > 0 ? `${horas} h ${mins} min` : `${mins} min`;
   return `Entrada autorizada por ${entry.adminNombre} (vigente ${vigencia} más)`;
+}
+
+/** Solo tests: limpia caché en memoria. */
+export function __resetMemoriaAutorizacionTurnoFhParaTests() {
+  memoriaAuth.clear();
 }
