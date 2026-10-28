@@ -1,0 +1,763 @@
+import { enRangoYmd, toYmd } from './fechas.js';
+import { fmtMonto } from './controlEfectivo.js';
+import { moduloCorteDesdeCuentaRt } from './contabilidadDepartamentos.js';
+
+export const AVISO_FALTA_TABLA_RT_CUENTAS =
+  'Ejecuta en Supabase: supabase/fix_rt_cuentas.sql para crear las cuentas RT.';
+
+/** Cuentas activas RT. Andrés / ABB / JLBB salieron del panel (solo histórico). */
+export const CUENTAS_RT = [
+  { id: 'francisco', nombre: 'Francisco (FJBB)', patrones: ['francisco', 'fjbb'] },
+  { id: 'servicios', nombre: 'Servicios (liquidación)', patrones: ['servicios', 'servicio', 'fondo servicios'] },
+  { id: 'cheche', nombre: 'Cheche (Tesorería)', patrones: ['cheche', 'tesoreria', 'tesorería'] },
+];
+
+/** Nombres antiguos: siguen resolviendo liquidaciones históricas, no se muestran. */
+export const CUENTAS_RT_LEGACY = [
+  { id: 'andres', nombre: 'Andrés', patrones: ['andres', 'andrés', 'amr'] },
+  { id: 'abb', nombre: 'ABB', patrones: ['abb', 'antonio'] },
+  { id: 'jlbb', nombre: 'JLBB', patrones: ['jlbb', 'jose luis', 'josé luis'] },
+];
+
+export const CUENTA_RT_FRANCISCO_ID = 'francisco';
+export const CUENTA_RT_SERVICIOS_ID = 'servicios';
+export const CUENTA_RT_ABB_ID = 'abb';
+
+/** Tarjetas en pestaña Cuentas RT (sin Cheche). */
+export const CUENTAS_RT_PANEL = CUENTAS_RT.filter((c) => c.id !== 'cheche');
+
+/** Liquidación de mercancía / recolecciones → solo Francisco. */
+export const CUENTAS_RT_LIQUIDACION = CUENTAS_RT.filter((c) => c.id === 'francisco');
+
+/** Liquidación de cobros de servicio (Fondo / liberar servicios). */
+export const CUENTAS_RT_LIQUIDACION_SERVICIOS = CUENTAS_RT.filter((c) => c.id === 'servicios');
+
+/**
+ * Gastos operativos desde Cuentas RT: solo mercancía (Francisco).
+ * Servicios / Tesorería no se gastan aquí (solo recolección de servicios → Cheche).
+ */
+export const CUENTAS_RT_GASTO = CUENTAS_RT_LIQUIDACION;
+
+/** Tesorería RC/VentaRuta: recibe fondos desde la cuenta Servicios. Tesorero Cheche. */
+export const CUENTA_TESORERIA_ID = 'cheche';
+/** Origen de fondos de servicio hacia Tesorería (alias histórico del id). */
+export const ADMIN_TESORERIA_CUENTA_ID = CUENTA_RT_SERVICIOS_ID;
+/** Solo la cuenta Servicios envía a Tesorería (Cheche). */
+export const CUENTAS_ORIGEN_TESORERIA = [CUENTA_RT_SERVICIOS_ID];
+
+/** Cuentas exclusivas de recolección / pagos de servicio (no mercancía). */
+export function esCuentaSoloServicios(cuentaId) {
+  const id = String(cuentaId || '');
+  return id === CUENTA_RT_SERVICIOS_ID || id === CUENTA_TESORERIA_ID;
+}
+
+export const PRESETS_RT_CUENTAS = [
+  { id: 'hoy', label: 'Hoy' },
+  { id: '7d', label: 'Últimos 7 días' },
+  { id: 'mes', label: 'Mes actual' },
+  { id: '6m', label: 'Últimos 6 meses' },
+  { id: 'anual', label: 'Anual' },
+];
+
+function normNombre(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+export function esErrorTablaRtCuentas(error) {
+  const msg = String(error?.message || '');
+  return (
+    error?.code === '42P01' ||
+    (msg.includes('relation') && (msg.includes('rt_cuentas') || msg.includes('rt_movimientos_cuenta')))
+  );
+}
+
+function coincidePatronCuenta(n, tokens, patrones) {
+  return (patrones || []).some((p) => {
+    const pn = normNombre(p);
+    if (!pn) return false;
+    if (pn.length <= 4) return n === pn || tokens.includes(pn);
+    return n.includes(pn) || pn.includes(n);
+  });
+}
+
+export function resolverCuentaRtPorNombre(nombre) {
+  const n = normNombre(nombre);
+  if (!n) return null;
+  const tokens = n.split(' ').filter(Boolean);
+  for (const c of CUENTAS_RT) {
+    if (coincidePatronCuenta(n, tokens, c.patrones)) return c.id;
+  }
+  for (const c of CUENTAS_RT_LEGACY) {
+    if (coincidePatronCuenta(n, tokens, c.patrones)) return c.id;
+  }
+  return null;
+}
+
+/** Cuenta mercancía por defecto: Francisco si el nombre no mapea a una cuenta activa de liquidación. */
+export function cuentaRtMercanciaPorDefecto(nombre) {
+  const id = resolverCuentaRtPorNombre(nombre);
+  if (CUENTAS_RT_LIQUIDACION.some((c) => c.id === id)) return id;
+  return CUENTA_RT_FRANCISCO_ID;
+}
+
+export function slugCuentaRt(nombre) {
+  const n = normNombre(nombre).replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return (n || 'cuenta').slice(0, 40);
+}
+
+/** Resuelve cuenta RT del admin; si no existe, la crea. */
+export async function resolverOCrearCuentaRt(supabase, nombre) {
+  const conocido = resolverCuentaRtPorNombre(nombre);
+  const id = conocido || slugCuentaRt(nombre);
+  const meta = CUENTAS_RT.find((c) => c.id === id);
+  const etiqueta = meta?.nombre || String(nombre || '').trim() || id;
+  if (!supabase) return { ok: true, cuentaId: id, nombre: etiqueta, creada: false };
+  const { error } = await supabase.from('rt_cuentas').upsert(
+    { id, nombre: etiqueta, activo: true },
+    { onConflict: 'id' },
+  );
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, cuentaId: id, nombre: etiqueta };
+}
+
+export function etiquetaCuentaRt(id) {
+  const key = String(id || '');
+  return (
+    CUENTAS_RT.find((c) => c.id === key)?.nombre
+    || CUENTAS_RT_LEGACY.find((c) => c.id === key)?.nombre
+    || key
+    || '—'
+  );
+}
+
+export function saldoDesdeMovimientos(movs = []) {
+  return (movs || []).reduce((acc, m) => {
+    const v = Number(m.monto) || 0;
+    if (m.tipo === 'liquidacion' || m.tipo === 'transferencia_recibida') return acc + v;
+    if (m.tipo === 'transferencia_enviada' || m.tipo === 'gasto') return acc - v;
+    return acc;
+  }, 0);
+}
+
+export function filtrarMovimientosRtPorFecha(movs, { desde, hasta } = {}) {
+  if (!desde && !hasta) return movs || [];
+  return (movs || []).filter((m) => enRangoYmd(m.fecha, desde, hasta));
+}
+
+export function resumenPeriodoRt(movs = []) {
+  const ingresos = movs
+    .filter((m) => m.tipo === 'liquidacion' || m.tipo === 'transferencia_recibida')
+    .reduce((a, m) => a + Number(m.monto || 0), 0);
+  const egresos = movs
+    .filter((m) => m.tipo === 'transferencia_enviada' || m.tipo === 'gasto')
+    .reduce((a, m) => a + Number(m.monto || 0), 0);
+  return { ingresos, egresos, neto: ingresos - egresos, count: movs.length };
+}
+
+export async function listarCuentasRt(supabase) {
+  if (!supabase) return { data: [], error: null };
+  const { data, error } = await supabase.from('rt_cuentas').select('*').eq('activo', true).order('nombre');
+  if (error) return { data: [], error };
+  return { data: data?.length ? data : CUENTAS_RT.map((c) => ({ id: c.id, nombre: c.nombre, activo: true })), error: null };
+}
+
+export async function listarMovimientosCuentaRt(supabase, cuentaId, { desde, hasta } = {}) {
+  if (!supabase || !cuentaId) return { data: [], error: null };
+  let q = supabase
+    .from('rt_movimientos_cuenta')
+    .select('*')
+    .eq('cuenta_id', cuentaId)
+    .order('fecha', { ascending: false })
+    .limit(500);
+  if (desde) q = q.gte('fecha', `${desde}T00:00:00`);
+  if (hasta) q = q.lte('fecha', `${hasta}T23:59:59.999`);
+  const { data, error } = await q;
+  return { data: data || [], error };
+}
+
+export async function listarTodosMovimientosRt(supabase, { desde, hasta, cuentaId } = {}) {
+  if (!supabase) return { data: [], error: null };
+  let q = supabase.from('rt_movimientos_cuenta').select('*').order('fecha', { ascending: false }).limit(800);
+  if (cuentaId) q = q.eq('cuenta_id', cuentaId);
+  if (desde) q = q.gte('fecha', `${desde}T00:00:00`);
+  if (hasta) q = q.lte('fecha', `${hasta}T23:59:59.999`);
+  const { data, error } = await q;
+  return { data: data || [], error };
+}
+
+export async function calcularSaldosRt(supabase) {
+  const { data: movs, error } = await supabase.from('rt_movimientos_cuenta').select('cuenta_id, tipo, monto');
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { saldos: {}, desglose: {}, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { saldos: {}, desglose: {}, error: error.message };
+  }
+  const saldos = {};
+  const desglose = {};
+  for (const c of CUENTAS_RT) {
+    saldos[c.id] = 0;
+    desglose[c.id] = { liquidaciones: 0, transferenciasIn: 0, transferenciasOut: 0, gastos: 0, disponible: 0 };
+  }
+  for (const m of movs || []) {
+    const cid = m.cuenta_id;
+    if (!desglose[cid]) {
+      saldos[cid] = 0;
+      desglose[cid] = { liquidaciones: 0, transferenciasIn: 0, transferenciasOut: 0, gastos: 0, disponible: 0 };
+    }
+    const v = Number(m.monto || 0);
+    if (m.tipo === 'liquidacion') {
+      saldos[cid] += v;
+      desglose[cid].liquidaciones += v;
+    } else if (m.tipo === 'transferencia_recibida') {
+      saldos[cid] += v;
+      desglose[cid].transferenciasIn += v;
+    } else if (m.tipo === 'transferencia_enviada') {
+      saldos[cid] -= v;
+      desglose[cid].transferenciasOut += v;
+    } else if (m.tipo === 'gasto') {
+      saldos[cid] -= v;
+      desglose[cid].gastos += v;
+    }
+  }
+  for (const id of Object.keys(desglose)) {
+    desglose[id].disponible = Math.round((saldos[id] || 0) * 100) / 100;
+    desglose[id].liquidaciones = Math.round(desglose[id].liquidaciones * 100) / 100;
+    desglose[id].transferenciasIn = Math.round(desglose[id].transferenciasIn * 100) / 100;
+    desglose[id].transferenciasOut = Math.round(desglose[id].transferenciasOut * 100) / 100;
+    desglose[id].gastos = Math.round(desglose[id].gastos * 100) / 100;
+  }
+  return { saldos, desglose, error: null };
+}
+
+export async function acreditarLiquidacionCuentaRt(supabase, opts = {}) {
+  const {
+    cuentaId,
+    movimientoIds = [],
+    montoTotal,
+    usuarioNombre,
+    repartidorNombre,
+    notas,
+    fecha,
+    /** 'servicios' | 'mercancia' | null — valida destino según tipo de efectivo */
+    tipoPartida = null,
+  } = opts;
+  if (!supabase || !cuentaId) return { ok: false, error: 'Selecciona la cuenta RT que recibe el efectivo.' };
+  const monto = Number(montoTotal) || 0;
+  if (monto <= 0) return { ok: false, error: 'Monto de liquidación inválido.' };
+
+  if (tipoPartida === 'servicios' && cuentaId !== CUENTA_RT_SERVICIOS_ID) {
+    return {
+      ok: false,
+      error: 'Los cobros de servicio solo se acreditan en la cuenta Servicios (no en mercancía).',
+    };
+  }
+  if (tipoPartida === 'mercancia' && esCuentaSoloServicios(cuentaId)) {
+    return {
+      ok: false,
+      error: 'La cuenta Servicios / Tesorería es solo para recolección de servicios. La mercancía va a Francisco.',
+    };
+  }
+  if (cuentaId === CUENTA_TESORERIA_ID && tipoPartida !== 'tesoreria') {
+    return {
+      ok: false,
+      error: 'Tesorería (Cheche) no recibe liquidaciones directas. Liquida a Servicios y luego transfiere.',
+    };
+  }
+
+  const meta =
+    CUENTAS_RT.find((c) => c.id === cuentaId)
+    || CUENTAS_RT_LEGACY.find((c) => c.id === cuentaId);
+  if (meta) {
+    const { error: errCuenta } = await supabase.from('rt_cuentas').upsert(
+      { id: cuentaId, nombre: meta.nombre, activo: true },
+      { onConflict: 'id' },
+    );
+    if (errCuenta) {
+      if (esErrorTablaRtCuentas(errCuenta)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+      return { ok: false, error: errCuenta.message };
+    }
+  }
+
+  const grupoId = crypto.randomUUID();
+  const row = {
+    cuenta_id: cuentaId,
+    tipo: 'liquidacion',
+    monto: Math.round(monto * 100) / 100,
+    fecha: fecha || new Date().toISOString(),
+    usuario: usuarioNombre || null,
+    notas: notas || `Liquidación recolecciones · ${repartidorNombre || 'recolector'}`,
+    grupo_id: grupoId,
+    repartidor_nombre: repartidorNombre || null,
+    liquidacion_movimientos: movimientoIds?.length ? movimientoIds : null,
+  };
+
+  const { error } = await supabase.from('rt_movimientos_cuenta').insert([row]);
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, monto, cuentaId };
+}
+
+/** Incluye «Venta Ruta»: efectivo de mercancía vendida en el camión (Pendientes → Francisco). */
+export const TIPOS_LIQUIDACION_RT = [
+  'Recolección',
+  'Entrega Crédito',
+  'Cobro Crédito',
+  'Cobro Servicio',
+  'Venta Ruta',
+];
+
+async function idsTransitoYaAcreditadosRt(supabase) {
+  const { data, error } = await supabase
+    .from('rt_movimientos_cuenta')
+    .select('liquidacion_movimientos')
+    .eq('tipo', 'liquidacion');
+  if (error) throw error;
+  const ids = new Set();
+  for (const row of data || []) {
+    const arr = row.liquidacion_movimientos;
+    if (Array.isArray(arr)) arr.forEach((id) => ids.add(String(id)));
+  }
+  return ids;
+}
+
+function claveGrupoLiquidacionHistorica(m) {
+  const f = m.fecha_liquidacion ? String(m.fecha_liquidacion).slice(0, 19) : 'sin-fecha';
+  return `${f}|${m.usuario_liquida || ''}|${m.repartidor_id || ''}`;
+}
+
+function agruparLiquidacionesHistoricasPendientes(rows, yaAcreditados) {
+  const pendientes = (rows || []).filter((m) => m.fecha_liquidacion && !yaAcreditados.has(String(m.id)));
+  const map = new Map();
+  for (const m of pendientes) {
+    const key = claveGrupoLiquidacionHistorica(m);
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        fecha: m.fecha_liquidacion,
+        usuario: m.usuario_liquida || '',
+        repartidorId: m.repartidor_id || '',
+        repartidorNombre: m.repartidores?.nombre || '',
+        ids: [],
+        monto: 0,
+      });
+    }
+    const g = map.get(key);
+    g.ids.push(m.id);
+    g.monto += Number(m.monto || 0);
+  }
+  return [...map.values()].map((g) => ({ ...g, monto: Math.round(g.monto * 100) / 100 }));
+}
+
+/** Liquidaciones selladas antes de existir rt_movimientos_cuenta. */
+export async function resumenLiquidacionesHistoricasRt(supabase, { cuentaFallback } = {}) {
+  if (!supabase) return { ok: false, error: 'Sin conexión.' };
+  try {
+    const [yaIds, liqRes] = await Promise.all([
+      idsTransitoYaAcreditadosRt(supabase),
+      supabase
+        .from('transito_efectivo')
+        .select('id, monto, fecha_liquidacion, usuario_liquida, repartidor_id, repartidores(nombre)')
+        .eq('estatus', 'Liquidado')
+        .in('tipo_movimiento', TIPOS_LIQUIDACION_RT)
+        .not('fecha_liquidacion', 'is', null),
+    ]);
+    if (liqRes.error) {
+      if (esErrorTablaRtCuentas(liqRes.error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+      return { ok: false, error: liqRes.error.message };
+    }
+
+    const grupos = agruparLiquidacionesHistoricasPendientes(liqRes.data, yaIds);
+    let montoAsignable = 0;
+    let montoSinCuenta = 0;
+    let gruposAsignables = 0;
+    let gruposSinCuenta = 0;
+    const usuariosSinCuenta = new Set();
+
+    for (const g of grupos) {
+      const cuentaId = resolverCuentaRtPorNombre(g.usuario) || cuentaFallback || null;
+      if (cuentaId) {
+        montoAsignable += g.monto;
+        gruposAsignables += 1;
+      } else {
+        montoSinCuenta += g.monto;
+        gruposSinCuenta += 1;
+        if (g.usuario) usuariosSinCuenta.add(g.usuario);
+      }
+    }
+
+    return {
+      ok: true,
+      totalGrupos: grupos.length,
+      gruposAsignables,
+      gruposSinCuenta,
+      montoAsignable,
+      montoSinCuenta,
+      movimientosPendientes: grupos.reduce((a, g) => a + g.ids.length, 0),
+      usuariosSinCuenta: [...usuariosSinCuenta],
+    };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+export async function importarLiquidacionesHistoricasRt(supabase, { cuentaFallback, usuarioNombre } = {}) {
+  if (!supabase) return { ok: false, error: 'Sin conexión.' };
+  if (!cuentaFallback) {
+    return { ok: false, error: 'Indica una cuenta por defecto para liquidaciones sin nombre Francisco.' };
+  }
+
+  try {
+    const [yaIds, liqRes] = await Promise.all([
+      idsTransitoYaAcreditadosRt(supabase),
+      supabase
+        .from('transito_efectivo')
+        .select('id, monto, fecha_liquidacion, usuario_liquida, repartidor_id, repartidores(nombre)')
+        .eq('estatus', 'Liquidado')
+        .in('tipo_movimiento', TIPOS_LIQUIDACION_RT)
+        .not('fecha_liquidacion', 'is', null),
+    ]);
+    if (liqRes.error) {
+      if (esErrorTablaRtCuentas(liqRes.error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+      return { ok: false, error: liqRes.error.message };
+    }
+
+    const grupos = agruparLiquidacionesHistoricasPendientes(liqRes.data, yaIds);
+    if (!grupos.length) return { ok: true, importados: 0, omitidos: 0, monto: 0 };
+
+    let importados = 0;
+    let omitidos = 0;
+    let monto = 0;
+
+    for (const g of grupos) {
+      const cuentaId = resolverCuentaRtPorNombre(g.usuario) || cuentaFallback;
+      if (!cuentaId) {
+        omitidos += 1;
+        continue;
+      }
+      const res = await acreditarLiquidacionCuentaRt(supabase, {
+        cuentaId,
+        movimientoIds: g.ids,
+        montoTotal: g.monto,
+        usuarioNombre: g.usuario || usuarioNombre,
+        repartidorNombre: g.repartidorNombre,
+        fecha: g.fecha,
+        notas: `Liquidación histórica importada · ${g.repartidorNombre || 'recolector'}`,
+      });
+      if (!res.ok) return { ok: false, error: res.error, importados, omitidos };
+      importados += 1;
+      monto += g.monto;
+    }
+
+    return { ok: true, importados, omitidos, monto, movimientos: grupos.reduce((a, g) => a + g.ids.length, 0) };
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+}
+
+export async function transferirEntreCuentasRt(supabase, opts = {}) {
+  const { desdeId, haciaId, monto, usuarioNombre, notas, permitirServiciosTesoreria = false } = opts;
+  if (!supabase) return { ok: false, error: 'Sin conexión.' };
+  if (!desdeId || !haciaId) return { ok: false, error: 'Selecciona cuenta origen y destino.' };
+  if (desdeId === haciaId) return { ok: false, error: 'Origen y destino deben ser distintos.' };
+  const m = Number(monto) || 0;
+  if (m <= 0) return { ok: false, error: 'Indica un monto mayor a cero.' };
+
+  const mezclaMercanciaServicios =
+    (esCuentaSoloServicios(desdeId) && !esCuentaSoloServicios(haciaId))
+    || (!esCuentaSoloServicios(desdeId) && esCuentaSoloServicios(haciaId));
+  const esServiciosATesoreria =
+    desdeId === CUENTA_RT_SERVICIOS_ID && haciaId === CUENTA_TESORERIA_ID;
+  if (mezclaMercanciaServicios && !(permitirServiciosTesoreria && esServiciosATesoreria)) {
+    return {
+      ok: false,
+      error:
+        'Servicios y Tesorería son solo para recolección de servicios. '
+        + 'No se mezclan con mercancía (Francisco). Usa Fondo/Tesorería para Servicios → Cheche.',
+    };
+  }
+
+  const { saldos, error: errSaldo } = await calcularSaldosRt(supabase);
+  if (errSaldo) return { ok: false, error: errSaldo };
+  const disponible = Number(saldos[desdeId]) || 0;
+  if (m > disponible + 0.001) {
+    return { ok: false, error: `Saldo insuficiente en ${etiquetaCuentaRt(desdeId)} (${fmtMonto(disponible)} disponible).` };
+  }
+
+  const grupoId = crypto.randomUUID();
+  const fecha = new Date().toISOString();
+  const detalle = notas?.trim() || `Transferencia a ${etiquetaCuentaRt(haciaId)}`;
+  const rows = [
+    {
+      cuenta_id: desdeId,
+      tipo: 'transferencia_enviada',
+      monto: Math.round(m * 100) / 100,
+      fecha,
+      usuario: usuarioNombre || null,
+      notas: detalle,
+      grupo_id: grupoId,
+      cuenta_relacionada: haciaId,
+    },
+    {
+      cuenta_id: haciaId,
+      tipo: 'transferencia_recibida',
+      monto: Math.round(m * 100) / 100,
+      fecha,
+      usuario: usuarioNombre || null,
+      notas: `Recibido de ${etiquetaCuentaRt(desdeId)}${notas?.trim() ? ` · ${notas.trim()}` : ''}`,
+      grupo_id: grupoId,
+      cuenta_relacionada: desdeId,
+    },
+  ];
+
+  const { error } = await supabase.from('rt_movimientos_cuenta').insert(rows);
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, monto: m, desdeId, haciaId };
+}
+
+/** Registra gasto desde saldo RT y lo refleja en cortes_contabilidad_gastos. */
+export async function registrarGastoCuentaRt(supabase, opts = {}) {
+  const {
+    cuentaId,
+    monto,
+    descripcion,
+    categoria = 'GASTOS OPERATIVOS',
+    subcategoria = 'CUENTA RT',
+    tienda = 'MAIN',
+    usuarioNombre,
+  } = opts;
+  if (!supabase) return { ok: false, error: 'Sin conexión.' };
+  if (!cuentaId) return { ok: false, error: 'Selecciona la cuenta RT (Francisco).' };
+  if (cuentaId === CUENTA_RT_SERVICIOS_ID) {
+    return {
+      ok: false,
+      error:
+        'La cuenta Servicios es solo para recolección de servicios. '
+        + 'Los egresos del proveedor se registran en Tesorería (Cheche), no como gasto RT.',
+    };
+  }
+  const desc = String(descripcion || '').trim();
+  if (!desc) return { ok: false, error: 'Describe en qué se usó el dinero.' };
+  const m = Number(monto) || 0;
+  if (m <= 0) return { ok: false, error: 'Indica un monto mayor a cero.' };
+
+  const { saldos, error: errSaldo } = await calcularSaldosRt(supabase);
+  if (errSaldo) return { ok: false, error: errSaldo };
+  const disponible = Number(saldos[cuentaId]) || 0;
+  if (m > disponible + 0.001) {
+    return { ok: false, error: `Saldo insuficiente en ${etiquetaCuentaRt(cuentaId)} (${fmtMonto(disponible)} disponible).` };
+  }
+
+  const cuentaLabel = etiquetaCuentaRt(cuentaId);
+  const comentarioContab = `${desc} · pagado desde cuenta RT ${cuentaLabel}`;
+
+  const { data: gastoRow, error: errGasto } = await supabase
+    .from('cortes_contabilidad_gastos')
+    .insert([
+      {
+        sucursal_id: tienda || 'MAIN',
+        modulo: moduloCorteDesdeCuentaRt(cuentaId),
+        categoria: String(categoria || 'GASTOS OPERATIVOS').trim().toUpperCase(),
+        subcategoria: String(subcategoria || 'CUENTA RT').trim().toUpperCase(),
+        comentario: comentarioContab,
+        monto: Math.round(m * 100) / 100,
+        usuario_nombre: cuentaLabel,
+        cerrado: false,
+        estado_aprobacion: 'aprobado',
+        solicitado_por: usuarioNombre || null,
+        aprobado_por: usuarioNombre || null,
+        aprobado_at: new Date().toISOString(),
+      },
+    ])
+    .select('id')
+    .single();
+
+  if (errGasto) {
+    if (errGasto.code === '42P01') {
+      return { ok: false, error: 'Ejecuta supabase/fix_cortes_contabilidad.sql en Supabase.' };
+    }
+    return { ok: false, error: errGasto.message };
+  }
+
+  const grupoId = crypto.randomUUID();
+  const row = {
+    cuenta_id: cuentaId,
+    tipo: 'gasto',
+    monto: Math.round(m * 100) / 100,
+    fecha: new Date().toISOString(),
+    usuario: usuarioNombre || null,
+    notas: desc,
+    grupo_id: grupoId,
+    gasto_contabilidad_id: gastoRow?.id || null,
+  };
+
+  const { error: errRt } = await supabase.from('rt_movimientos_cuenta').insert([row]);
+  if (errRt) {
+    if (gastoRow?.id) await supabase.from('cortes_contabilidad_gastos').delete().eq('id', gastoRow.id);
+    if (esErrorTablaRtCuentas(errRt)) {
+      return {
+        ok: false,
+        error: `${AVISO_FALTA_TABLA_RT_CUENTAS} También ejecuta supabase/fix_rt_cuentas_gasto.sql para permitir gastos.`,
+      };
+    }
+    const msg = String(errRt.message || '');
+    if (msg.includes('gasto_contabilidad_id') || msg.includes('rt_movimientos_cuenta_tipo_check')) {
+      return {
+        ok: false,
+        error:
+          'Falta migración en Supabase. Abre SQL Editor y ejecuta supabase/fix_rt_cuentas_gasto.sql (agrega tipo gasto y columna gasto_contabilidad_id). Luego reintenta el descuento.',
+      };
+    }
+    return { ok: false, error: errRt.message };
+  }
+
+  return { ok: true, monto: m, cuentaId, gastoContabilidadId: gastoRow?.id };
+}
+
+export function etiquetaTipoMovimientoRt(tipo) {
+  if (tipo === 'liquidacion') return 'Liquidación';
+  if (tipo === 'transferencia_enviada') return 'Transferencia enviada';
+  if (tipo === 'transferencia_recibida') return 'Transferencia recibida';
+  if (tipo === 'gasto') return 'Gasto';
+  return tipo || '—';
+}
+
+export function signoMovimientoRt(tipo) {
+  if (tipo === 'transferencia_enviada' || tipo === 'gasto') return '-';
+  return '+';
+}
+
+export function esEgresoMovimientoRt(tipo) {
+  return tipo === 'transferencia_enviada' || tipo === 'gasto';
+}
+
+export function rangoDesdePresetRt(preset) {
+  const hoy = new Date();
+  const hasta = toYmd(hoy);
+  if (preset === 'hoy') return { desde: hasta, hasta };
+  if (preset === '7d') return { desde: toYmd(new Date(hoy.getTime() - 7 * 864e5)), hasta };
+  if (preset === 'mes') return { desde: toYmd(new Date(hoy.getFullYear(), hoy.getMonth(), 1)), hasta };
+  if (preset === '6m') {
+    const d = new Date(hoy);
+    d.setMonth(d.getMonth() - 6);
+    return { desde: toYmd(d), hasta };
+  }
+  if (preset === 'anual') return { desde: toYmd(new Date(hoy.getFullYear(), 0, 1)), hasta };
+  return null;
+}
+
+/** Asegura la cuenta RT donde se registran liquidaciones de servicios. */
+export async function asegurarCuentaServicios(supabase) {
+  if (!supabase) return { ok: true, cuentaId: CUENTA_RT_SERVICIOS_ID };
+  const meta = CUENTAS_RT.find((c) => c.id === CUENTA_RT_SERVICIOS_ID);
+  const { error } = await supabase.from('rt_cuentas').upsert(
+    { id: CUENTA_RT_SERVICIOS_ID, nombre: meta?.nombre || 'Servicios (liquidación)', activo: true },
+    { onConflict: 'id' },
+  );
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { ok: false, error: error.message };
+  }
+  return { ok: true, cuentaId: CUENTA_RT_SERVICIOS_ID };
+}
+
+/** Asegura Cheche (Tesorería) y la cuenta origen Servicios. */
+export async function asegurarCuentaTesoreria(supabase) {
+  if (!supabase) return { ok: true, cuentaId: CUENTA_TESORERIA_ID };
+  const { error } = await supabase.from('rt_cuentas').upsert(
+    { id: CUENTA_TESORERIA_ID, nombre: 'Cheche (Tesorería)', activo: true },
+    { onConflict: 'id' },
+  );
+  if (error) {
+    if (esErrorTablaRtCuentas(error)) return { ok: false, error: AVISO_FALTA_TABLA_RT_CUENTAS };
+    return { ok: false, error: error.message };
+  }
+  const srv = await asegurarCuentaServicios(supabase);
+  if (!srv.ok) return srv;
+  return { ok: true, cuentaId: CUENTA_TESORERIA_ID };
+}
+
+export function puedeAdministrarTesoreria(user) {
+  const rol = String(user?.rol || '').toLowerCase();
+  if (rol.includes('admin') || rol.includes('gerente')) return true;
+  const cuenta = resolverCuentaRtPorNombre(user?.nombre);
+  if (
+    cuenta === CUENTA_TESORERIA_ID
+    || cuenta === CUENTA_RT_SERVICIOS_ID
+    || cuenta === CUENTA_RT_FRANCISCO_ID
+    || cuenta === 'jlbb'
+  ) return true;
+  return false;
+}
+
+/**
+ * Envía fondos de servicios: cuenta Servicios → Tesorería (Cheche).
+ * Separado de la liquidación de mercancía (Francisco).
+ */
+export async function enviarFondosServiciosATesoreria(supabase, {
+  desdeId = CUENTA_RT_SERVICIOS_ID,
+  monto,
+  usuarioNombre = null,
+  notas = '',
+} = {}) {
+  if (!supabase) return { ok: false, error: 'Sin conexión.' };
+  const origen = String(desdeId || CUENTA_RT_SERVICIOS_ID).trim() || CUENTA_RT_SERVICIOS_ID;
+  if (!CUENTAS_ORIGEN_TESORERIA.includes(origen)) {
+    return {
+      ok: false,
+      error: 'Origen inválido. Tesorería solo recibe desde la cuenta Servicios (liquidación de fondos).',
+    };
+  }
+  const ensure = await asegurarCuentaTesoreria(supabase);
+  if (!ensure.ok) return ensure;
+
+  const detalle = String(notas || '').trim()
+    || `Fondos servicios → Tesorería Cheche (desde ${etiquetaCuentaRt(origen)})`;
+
+  return transferirEntreCuentasRt(supabase, {
+    desdeId: origen,
+    haciaId: CUENTA_TESORERIA_ID,
+    monto,
+    usuarioNombre,
+    notas: detalle,
+    permitirServiciosTesoreria: true,
+  });
+}
+
+export async function saldoTesoreria(supabase) {
+  const ensure = await asegurarCuentaTesoreria(supabase);
+  if (!ensure.ok) return { saldo: 0, error: ensure.error };
+  const { saldos, error } = await calcularSaldosRt(supabase);
+  if (error) return { saldo: 0, error };
+  return { saldo: Math.round((Number(saldos[CUENTA_TESORERIA_ID]) || 0) * 100) / 100 };
+}
+
+export async function listarMovimientosTesoreria(supabase, opts = {}) {
+  const ensure = await asegurarCuentaTesoreria(supabase);
+  if (!ensure.ok) return { data: [], error: ensure.error };
+  return listarMovimientosCuentaRt(supabase, CUENTA_TESORERIA_ID, opts);
+}
+
+/** Saldos disponibles en cuenta Servicios para enviar a Tesorería. */
+export async function saldosOrigenTesoreria(supabase) {
+  await asegurarCuentaServicios(supabase);
+  const { saldos, error } = await calcularSaldosRt(supabase);
+  if (error) return { data: [], error };
+  return {
+    data: CUENTAS_ORIGEN_TESORERIA.map((id) => ({
+      id,
+      nombre: etiquetaCuentaRt(id),
+      saldo: Math.round((Number(saldos[id]) || 0) * 100) / 100,
+    })),
+  };
+}
