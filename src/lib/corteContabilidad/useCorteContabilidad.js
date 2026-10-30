@@ -1,0 +1,1202 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { turnoActual, nombreTurnoLegible } from '../turnos.js';
+import { empleadosParaCorte } from '../empleadosVisibles.js';
+import { createSubmitLock } from '../submitLock.js';
+import { permisosCorteContabilidad, puedeEditarCorteCampo } from './permisos.js';
+import { gastoRequiereEmpleado } from './catalogoGastos.js';
+import {
+  detalleRecoleccionParaIe,
+  gastosIdsDesdeUltimaRecoleccion,
+  gastosListaDesdeUltimaRecoleccion,
+  gastosPeriodoDesdeUltimaRecoleccion,
+  monedaAInyectarVirtual,
+  monedaFinalParaInyectarVirtual,
+  monedaTopeVirtual,
+  round2,
+} from './calc.js';
+import {
+  AVISO_FALTA_CORTES,
+  agregarGastoTurno,
+  cargarEstadoCorte,
+  cerrarGastosHuerfanosTrasCierre,
+  eliminarGastoTurno,
+  actualizarGastoTurno,
+  guardarEstadoCorte,
+  limpiarGastosTurno,
+  listarGastosTurno,
+  listarCierresCorte,
+  listarCierresCorteEliminados,
+  peekFolio,
+  registrarCierreCorte,
+  folioTrasCierre,
+  actualizarDetalleCierre,
+  actualizarCierreCorte,
+  eliminarCierreCorte,
+  restaurarCierreCorte,
+  notificarRecoleccionPendienteIe,
+} from './store.js';
+import { estadoAprobacionRecoleccionInicial } from '../contabilidadConstants.js';
+import { limiteHistorialCierresCorte } from '../archivo.js';
+import { normalizarRol } from '../roles.js';
+import { esUsuarioCubreTurno } from '../cubreTurno.js';
+
+async function sellarPrestamosColectados({
+  supabase,
+  sucursal,
+  modulo,
+  user,
+  gastos,
+  gastosIds,
+  folio,
+}) {
+  if (!supabase) return;
+  try {
+    const { marcarPrestamosColectadosEnRecoleccion } = await import('../cargosContabilidad.js');
+    await marcarPrestamosColectadosEnRecoleccion(supabase, {
+      sucursal,
+      modulo,
+      gastos,
+      gastosIds,
+      recolectorNombre: user?.nombre || null,
+      folio,
+    });
+  } catch {
+    /* no bloquear la recolección */
+  }
+  // Recolección de Virtual con deuda abierta de abarrotes → por_recolectar
+  if (String(modulo || '').toLowerCase() === 'virtual') {
+    try {
+      const { marcarPrestamosInterareaPorRecolectar } = await import('../valesPrestamos.js');
+      await marcarPrestamosInterareaPorRecolectar(supabase, {
+        sucursal,
+        areaDeuda: 'abarrotes',
+      });
+    } catch {
+      /* no bloquear */
+    }
+  }
+}
+
+function snapshotTurno(date = new Date()) {
+  const t = turnoActual(null, date);
+  if (!t) return null;
+  return {
+    id: t.id,
+    nombre: t.nombre,
+    hora_inicio: t.hora_inicio,
+    hora_fin: t.hora_fin,
+  };
+}
+
+function resolverTurnoSesion(estado, gastos = []) {
+  if (estado?.turno_sesion?.id || estado?.turno_sesion?.nombre) {
+    return estado.turno_sesion;
+  }
+  const primerGasto = (gastos || []).find((g) => g?.created_at);
+  if (primerGasto?.created_at) {
+    const when = new Date(primerGasto.created_at);
+    if (!Number.isNaN(when.getTime())) return snapshotTurno(when);
+  }
+  return snapshotTurno();
+}
+
+export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn, prepararTrasCierre, prepararTrasRecoleccion }) {
+  const [estado, setEstado] = useState(() => ({}));
+  const [gastos, setGastos] = useState([]);
+  const [folio, setFolio] = useState('');
+  const [aviso, setAviso] = useState('');
+  const [cargando, setCargando] = useState(true);
+  const [historial, setHistorial] = useState([]);
+  const [historialEliminados, setHistorialEliminados] = useState([]);
+  const [empleados, setEmpleados] = useState([]);
+  const [usuariosRawCorte, setUsuariosRawCorte] = useState([]);
+  const saveTimer = useRef(null);
+  /** Generación de guardado: invalida debounces viejos tras cierre/recolección. */
+  const saveGen = useRef(0);
+  /** Candado síncrono: evita doble clic en Cerrar corte / Recolectar. */
+  const accionLock = useRef(createSubmitLock()).current;
+
+  const invalidarGuardadosPendientes = useCallback(() => {
+    clearTimeout(saveTimer.current);
+    saveTimer.current = null;
+    saveGen.current += 1;
+  }, []);
+  const perm = useMemo(
+    () => permisosCorteContabilidad(user?.rol ?? user?.role, user?.id),
+    [user?.rol, user?.role, user?.id],
+  );
+  const turno = useMemo(
+    () => nombreTurnoLegible(estado?.turno_sesion || turnoActual()),
+    [estado?.turno_sesion],
+  );
+
+  const calc = useMemo(() => calcFn(estado, gastos), [estado, gastos, calcFn]);
+
+  /**
+   * Alertas DINERO EN RECUPERACIÓN desactivadas en Virtual / Abarrotes / Garage.
+   * El seguimiento de negativos queda solo en el sistema de pagarés (Vales / RC Virtual).
+   * No altera cálculos ni cierre/recolección del corte.
+   */
+  const vistaRecuperacion = useMemo(() => {
+    const caja = Number(calc?.cajaActual);
+    const round2p = (n) => Math.round((Number(n) || 0) * 100) / 100;
+    return {
+      prestamos: [],
+      pagares: [],
+      deuda: 0,
+      deudaPrestamo: 0,
+      deudaPagare: 0,
+      venta: Number(calc?.venta) || 0,
+      recuperado: 0,
+      negativo: 0,
+      negativoRestante: 0,
+      negativoCaja: Number.isFinite(caja) && caja < -0.001 ? round2p(Math.abs(caja)) : 0,
+      cubiertoPorVenta: false,
+      cajaActual: Number.isFinite(caja) ? round2p(caja) : 0,
+      visible: false,
+      avisoEntregarTurno: false,
+      pendienteCajaRecuperada: false,
+      esCubreTurno: esUsuarioCubreTurno(user),
+    };
+  }, [calc?.venta, calc?.cajaActual, user]);
+
+  const puedeAbonarLiquidarPrestamo = false;
+  const puedeGenerarPagareCorte = false;
+
+  const refrescarPrestamosRecuperacion = useCallback(async () => {}, []);
+  const abonarPrestamoDesdeCorte = useCallback(async () => {}, []);
+  const liquidarPrestamoDesdeCorte = useCallback(async () => {}, []);
+  const generarPagareDesdeCorte = useCallback(async () => {}, []);
+
+  const persistir = useCallback(
+    async (nextEstado, gen) => {
+      if (gen != null && gen !== saveGen.current) return;
+      const res = await guardarEstadoCorte(supabase, sucursal, modulo, nextEstado);
+      if (gen != null && gen !== saveGen.current) return;
+      if (res?.aviso) setAviso(res.aviso);
+      if (res?.blocked) setAviso(res.error || 'Guardado de caja chica bloqueado; recargue.');
+    },
+    [supabase, sucursal, modulo],
+  );
+
+  const patchEstado = useCallback(
+    (patch) => {
+      setEstado((prev) => {
+        const next = { ...prev, ...patch };
+        clearTimeout(saveTimer.current);
+        const gen = saveGen.current;
+        saveTimer.current = setTimeout(() => persistir(next, gen), 400);
+        return next;
+      });
+    },
+    [persistir],
+  );
+
+  const patchEstadoPermitido = useCallback(
+    (patch) => {
+      if (perm.editarTodo) {
+        patchEstado(patch);
+        return;
+      }
+      const filtrado = { ...patch };
+      const keys = Object.keys(filtrado);
+
+      const camposCajero = new Set([
+        'moneda_final',
+        'moneda_final_editada',
+        'faltante',
+        'comentarios',
+        'maquinas',
+        'pin1',
+        'pin2',
+        'dsch',
+        'venta',
+        'tarjeta',
+        'venta_manual',
+        'subtotal_manual',
+        'caja_actual_manual',
+      ]);
+      const soloOperacion = keys.length > 0 && keys.every((k) => camposCajero.has(k));
+      if (soloOperacion && perm.guardar) {
+        if (('moneda_final' in filtrado || 'moneda_final_editada' in filtrado) && !puedeEditarCorteCampo(perm, 'moneda_final')) return;
+        if ('faltante' in filtrado && !puedeEditarCorteCampo(perm, 'faltante')) return;
+        if ('comentarios' in filtrado && !puedeEditarCorteCampo(perm, 'comentarios')) return;
+        patchEstado(filtrado);
+        return;
+      }
+
+      if ('moneda_final' in filtrado || 'moneda_final_editada' in filtrado) {
+        if (!puedeEditarCorteCampo(perm, 'moneda_final')) return;
+      }
+      if ('faltante' in filtrado && !puedeEditarCorteCampo(perm, 'faltante')) return;
+      if ('comentarios' in filtrado && !puedeEditarCorteCampo(perm, 'comentarios')) return;
+      if ('fondo' in filtrado && !(perm.fondo || perm.recoleccion)) return;
+      if ('caja_anterior' in filtrado && !(perm.caja_anterior || perm.recoleccion)) return;
+      // MI del corte solo admin (inyección manual). Tope de operación: admin/recolector.
+      if ('moneda_inicial_turno' in filtrado && !perm.editarTodo) return;
+      if (
+        ('moneda_inicial' in filtrado ||
+          'recoleccion' in filtrado ||
+          'recoleccion_turno' in filtrado ||
+          'recoleccion_anterior' in filtrado ||
+          'precoleccion' in filtrado ||
+          '_precoleccion_editada' in filtrado) &&
+        !perm.recoleccion &&
+        !perm.moneda_inicial
+      ) {
+        return;
+      }
+      patchEstado(filtrado);
+    },
+    [patchEstado, perm],
+  );
+
+  const refrescarHistorial = useCallback(async () => {
+    const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+    setHistorial(hist.data || []);
+    if (hist.aviso) setAviso(hist.aviso);
+    if (perm.editarTodo) {
+      const pap = await listarCierresCorteEliminados(supabase, sucursal, modulo, 30);
+      setHistorialEliminados(pap.data || []);
+      if (pap.aviso) setAviso(pap.aviso);
+    } else {
+      setHistorialEliminados([]);
+    }
+  }, [supabase, sucursal, modulo, perm.editarTodo]);
+
+  const cargar = useCallback(async () => {
+    setCargando(true);
+    // Si un cierre previo dejó gastos abiertos por error, ciérralos antes de listar.
+    await cerrarGastosHuerfanosTrasCierre(supabase, sucursal, modulo);
+    const cargarUsuariosCorte = async () => {
+      if (!supabase) return { data: [] };
+      const intentos = [
+        'id, nombre, rol, sucursal_id, tipo_empleado, nomina_pagador, turno_id, turno_horario, activo',
+        'id, nombre, rol, sucursal_id, tipo_empleado, nomina_pagador, activo',
+        'id, nombre, rol, sucursal_id, tipo_empleado, activo',
+        'id, nombre, rol, sucursal_id, activo',
+        '*',
+      ];
+      let lastErr = null;
+      for (const cols of intentos) {
+        const res = await supabase.from('usuarios').select(cols).order('nombre');
+        if (!res.error) return res;
+        lastErr = res.error;
+      }
+      return { data: [], error: lastErr };
+    };
+
+    const [estRes, gasRes, histRes, empRes] = await Promise.all([
+      cargarEstadoCorte(supabase, sucursal, modulo),
+      listarGastosTurno(supabase, sucursal, modulo),
+      listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo)),
+      cargarUsuariosCorte(),
+    ]);
+    if (estRes.aviso || gasRes.aviso || histRes.aviso) {
+      setAviso(estRes.aviso || gasRes.aviso || histRes.aviso || '');
+    }
+    if (empRes.error) {
+      setAviso((prev) => prev || `Empleados: ${empRes.error.message || empRes.error}`);
+    }
+    let nextEstado = estRes.estado || {};
+    const nextGastos = gasRes.data || [];
+    if (modulo === 'virtual' && !nextEstado.turno_sesion) {
+      const sesion = resolverTurnoSesion(nextEstado, nextGastos);
+      if (sesion) {
+        nextEstado = { ...nextEstado, turno_sesion: sesion };
+        await guardarEstadoCorte(supabase, sucursal, modulo, nextEstado);
+      }
+    }
+    setEstado(nextEstado);
+    setGastos(nextGastos);
+    setHistorial(histRes.data || []);
+    setEmpleados(empleadosParaCorte(empRes.data || [], sucursal, modulo, user?.rol, {
+      esCubreTurno: esUsuarioCubreTurno(user),
+      user,
+    }));
+    setUsuariosRawCorte(empRes.data || []);
+    if (perm.editarTodo) {
+      const pap = await listarCierresCorteEliminados(supabase, sucursal, modulo, 30);
+      setHistorialEliminados(pap.data || []);
+      if (pap.aviso) setAviso(pap.aviso);
+    } else {
+      setHistorialEliminados([]);
+    }
+    if (nextEstado?.folio) {
+      setFolio(nextEstado.folio);
+    } else {
+      const f = await peekFolio(supabase, sucursal, modulo);
+      setFolio(f);
+      if (modulo === 'abarrotes' && f) {
+        nextEstado = { ...nextEstado, folio: f };
+        setEstado(nextEstado);
+        await guardarEstadoCorte(supabase, sucursal, modulo, nextEstado);
+      }
+    }
+    setCargando(false);
+  }, [supabase, sucursal, modulo, user, perm.editarTodo]);
+
+  useEffect(() => {
+    cargar();
+    return () => {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    };
+  }, [cargar]);
+
+  const agregarGasto = async (gasto) => {
+    if (!puedeEditarCorteCampo(perm, 'gastos')) return;
+    if (gastoRequiereEmpleado(modulo, gasto?.categoria) && !gasto?.usuario_id) {
+      return alert('Selecciona el empleado a quien se descontará el consumo en nómina.');
+    }
+    // Fija el turno de la sesión al primer registro (si el corte quedó abierto entre turnos).
+    if (modulo === 'virtual' && !estado.turno_sesion) {
+      const sesion = snapshotTurno();
+      if (sesion) patchEstado({ turno_sesion: sesion });
+    }
+    const optsBase = {
+      rolActor: user?.rol,
+      nombreActor: user?.nombre,
+      esCubreTurno: esUsuarioCubreTurno(user),
+      user,
+      empleadosCatalogo: empleados,
+      usuariosParaValidarIndirectos: usuariosRawCorte,
+    };
+    let res = await agregarGastoTurno(supabase, sucursal, modulo, gasto, optsBase);
+    if (res?.duplicado) {
+      const forzar = window.confirm(
+        `${res.error}\n\n¿Registrar de todos modos en este corte?`,
+      );
+      if (!forzar) return { ok: false, cancelado: true, duplicado: true };
+      res = await agregarGastoTurno(supabase, sucursal, modulo, gasto, {
+        ...optsBase,
+        forzarDuplicado: true,
+      });
+    }
+    if (!res.ok) {
+      alert(res.error);
+      return { ok: false, error: res.error };
+    }
+    await cargar();
+    const gas = await listarGastosTurno(supabase, sucursal, modulo);
+    setGastos(gas.data || []);
+    return { ok: true };
+  };
+
+  const quitarGasto = async (id) => {
+    if (!puedeEditarCorteCampo(perm, 'gastos')) return;
+    const res = await eliminarGastoTurno(supabase, id, sucursal, modulo);
+    if (!res.ok) return alert(res.error);
+    setGastos((prev) => prev.filter((g) => String(g.id) !== String(id)));
+  };
+
+  const editarGasto = async (id, patch) => {
+    if (!puedeEditarCorteCampo(perm, 'gastos')) return;
+    const res = await actualizarGastoTurno(supabase, id, patch, sucursal, modulo);
+    if (!res.ok) return alert(res.error);
+    const gas = await listarGastosTurno(supabase, sucursal, modulo);
+    setGastos(gas.data || []);
+  };
+
+  const cerrarCorte = async (detalleExtra = {}) => {
+    if (!accionLock.tryBegin()) {
+      return { ok: false, skipped: true, error: 'Ya hay un cierre o recolección en curso.' };
+    }
+    // Evita que un debounce de 400ms pise el estado post-cierre con valores viejos.
+    invalidarGuardadosPendientes();
+    setCargando(true);
+    try {
+    if (!perm.guardar) {
+      return alert('No tiene permiso para cerrar este corte.');
+    }
+
+    // Queda a nombre del turno donde se hicieron los registros (sesión abierta),
+    // aunque se cierre ya entrado el siguiente turno.
+    const turnoCierre = estado.turno_sesion || snapshotTurno() || turnoActual();
+    const turnoTexto = nombreTurnoLegible(turnoCierre);
+    const folioCierre = modulo === 'abarrotes' ? estado.folio || folio : folio;
+    const gastosCierre = [...(gastos || [])];
+    const gastosIds = gastosCierre.map((g) => g.id).filter(Boolean);
+    const calcCierre = { ...calc };
+    const estadoCierre = { ...estado };
+
+    const payload = {
+      sucursal_id: sucursal || 'MAIN',
+      modulo,
+      folio: folioCierre,
+      turno: turnoTexto,
+      usuario_id: user?.id || null,
+      usuario_nombre: user?.nombre || null,
+      caja_actual: calc.cajaActual ?? 0,
+      ventas: calc.venta ?? 0,
+      detalle: {
+        ...estado,
+        gastos,
+        gastos_ids: gastosIds,
+        gastos_total: calc.gastosTotal,
+        subtotal: calc.subtotal,
+        venta_neta: calc.ventaNeta,
+        total_lectura: calc.totalLectura,
+        comentarios: estado.comentarios || '',
+        ...detalleExtra,
+        tipo_cierre: 'cierre',
+        turno_sesion: turnoCierre,
+      },
+    };
+    const res = await registrarCierreCorte(supabase, payload);
+    if (!res.ok) return alert(res.error || AVISO_FALTA_CORTES);
+
+    // Virtual/Abarrotes: gastos del turno se cierran al cortar (siguiente turno en $0).
+    // Garage: gastos y faltantes persisten turno a turno hasta recolección con máquinas en cero.
+    let limpia = { ok: true };
+    if (modulo !== 'garage') {
+      const idsGastos = (gastos || []).map((g) => g.id).filter(Boolean);
+      limpia = await limpiarGastosTurno(supabase, sucursal, modulo, idsGastos);
+    }
+    const nuevoEstado = prepararTrasCierre(estado, calc, detalleExtra);
+    // Nueva sesión abierta: turno actual (cuando arranca el siguiente corte).
+    if (modulo === 'virtual') {
+      nuevoEstado.turno_sesion = snapshotTurno() || turnoActual();
+    }
+    const nuevoFolio = await folioTrasCierre(supabase, sucursal, modulo, folioCierre);
+    setFolio(nuevoFolio);
+    nuevoEstado.folio = nuevoFolio;
+    // Nueva generación: ningún debounce previo puede pisar este arrastre.
+    invalidarGuardadosPendientes();
+    const saved = await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
+    if (!saved?.ok) {
+      alert(
+        `Corte guardado en historial, pero no se pudo fijar la caja chica del siguiente turno.\n` +
+          `${saved?.error || 'Error al guardar estado.'}\n` +
+          `Recargue el corte antes de seguir vendiendo.`,
+      );
+      return { ok: false, error: saved?.error || 'estado_post_cierre' };
+    }
+    setEstado(nuevoEstado);
+
+    const gas = await listarGastosTurno(supabase, sucursal, modulo);
+    const quedan = gas.data || [];
+    setGastos(quedan);
+
+    const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+    setHistorial(hist.data || []);
+
+    if (modulo !== 'garage' && (!limpia.ok || quedan.length > 0)) {
+      alert(
+        `Corte cerrado, pero los gastos no se reiniciaron bien.\n` +
+          `${limpia.error || `Quedan ${quedan.length} gasto(s) abiertos.`}\n` +
+          `Recargue o cierre de nuevo; si persiste, revise conexión a Supabase.`,
+      );
+      return { ok: false, error: limpia.error };
+    }
+
+    if (modulo === 'garage') {
+      alert(
+        'Corte cerrado. Gastos y faltantes se conservan para el siguiente turno.\n' +
+          'Solo se ponen en cero (y pasan a IE) al generar recolección con máquinas en cero.',
+      );
+    } else if (modulo !== 'virtual') {
+      alert('Corte cerrado y guardado en historial contabilidad.');
+    }
+
+    return {
+      ok: true,
+      folio: folioCierre,
+      turno: turnoTexto,
+      estadoImpresion: { ...estadoCierre, ...detalleExtra, tipo_cierre: 'cierre' },
+      gastosImpresion: gastosCierre,
+      calcImpresion: calcCierre,
+    };
+    } finally {
+      accionLock.end();
+      setCargando(false);
+    }
+  };
+
+  const registrarRecoleccion = async (opts = {}) => {
+    if (!accionLock.tryBegin()) {
+      return { ok: false, skipped: true, error: 'Ya hay un cierre o recolección en curso.' };
+    }
+    invalidarGuardadosPendientes();
+    setCargando(true);
+    try {
+    if (!perm.recoleccion) {
+      return alert('Solo el administrador o recolector con privilegio puede registrar recolección.');
+    }
+
+    if (modulo === 'garage') {
+      const calcRec =
+        opts.montoRecoleccion != null
+          ? round2(opts.montoRecoleccion)
+          : round2(estado.recoleccion);
+      const maquinasEnCero = opts.maquinasEnCero === true;
+      const antAntes = round2(estado.recoleccion_anterior);
+      const totalDefinitivo = round2(calcRec + antAntes);
+      if (maquinasEnCero) {
+        if (!(totalDefinitivo > 0)) {
+          return alert('Indique monto de recolección o debe existir recolección anterior.');
+        }
+      } else if (!(calcRec > 0)) {
+        return alert('Indique el monto de recolección.');
+      }
+      const tipo = maquinasEnCero ? 'recoleccion' : 'recoleccion_temporal';
+      const antTras = maquinasEnCero ? 0 : round2(antAntes + calcRec);
+      const folioRec = `REC-${folio || 'G'}`;
+      // Gastos abiertos del periodo (persisten entre cierres); no sumar historial o se duplican.
+      const gastosAbiertos = gastos || [];
+      const gastosIds = gastosAbiertos.map((g) => g.id).filter(Boolean);
+      const gastosTotal = round2(calc.gastosTotal);
+      const estadoAprob = maquinasEnCero
+        ? estadoAprobacionRecoleccionInicial(user?.nombre)
+        : null;
+      // Definitiva (máquinas + DSCH en ceros): actual + anterior → IE y desglose 60/40.
+      const efectivoIe = maquinasEnCero ? totalDefinitivo : calcRec;
+
+      const extrasBase = {
+        ...estado,
+        gastos: gastosAbiertos,
+        gastos_ids: gastosIds,
+        gastos_total: gastosTotal,
+        subtotal: calc.subtotal,
+        venta_neta: calc.ventaNeta,
+        venta: calc.venta,
+        recoleccion: efectivoIe,
+        recoleccion_actual: calcRec,
+        recoleccion_anterior: antAntes,
+        recoleccion_anterior_tras: antTras,
+        recoleccion_total: maquinasEnCero ? totalDefinitivo : round2(calcRec + antAntes),
+        maquinas_en_cero: maquinasEnCero,
+        tipo_cierre: tipo,
+        comentarios: estado.comentarios || '',
+      };
+
+      const detalle = maquinasEnCero
+        ? detalleRecoleccionParaIe({
+            efectivo: efectivoIe,
+            gastosTotal,
+            extras: {
+              ...extrasBase,
+              estado_aprobacion: estadoAprob,
+            },
+          })
+        : extrasBase;
+
+      const payload = {
+        sucursal_id: sucursal || 'MAIN',
+        modulo,
+        folio: folioRec,
+        turno: 'RECOLECCION',
+        usuario_id: user?.id || null,
+        usuario_nombre: user?.nombre || null,
+        caja_actual: calc.cajaActual ?? 0,
+        ventas: calc.venta ?? 0,
+        detalle,
+      };
+      const res = await registrarCierreCorte(supabase, payload);
+      if (!res.ok) return { ok: false, error: res.error || AVISO_FALTA_CORTES };
+
+      await sellarPrestamosColectados({
+        supabase,
+        sucursal,
+        modulo,
+        user,
+        gastos: gastosAbiertos,
+        gastosIds,
+        folio: folioRec,
+      });
+
+      // Solo recolección definitiva (máquinas en cero) escala a Contabilidad / IE.
+      if (maquinasEnCero) {
+        if (estadoAprob === 'aprobado' && res.data) {
+          try {
+            const { liberarGastosCorteAIeTrasRecoleccion } = await import('../contVirtualEgresos.js');
+            await liberarGastosCorteAIeTrasRecoleccion(supabase, res.data);
+          } catch {
+            /* no bloquear */
+          }
+        } else if (estadoAprob === 'pendiente_admin' && res.data) {
+          await notificarRecoleccionPendienteIe(supabase, res.data);
+        }
+        await limpiarGastosTurno(supabase, sucursal, modulo, gastosIds);
+        const gas = await listarGastosTurno(supabase, sucursal, modulo);
+        setGastos(gas.data || []);
+      }
+
+      const prep = prepararTrasRecoleccion || ((e) => e);
+      const nuevoEstado = prep(estado, calc, {
+        maquinasEnCero,
+        montoRecoleccion: calcRec,
+      });
+      await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
+      setEstado(nuevoEstado);
+      const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+      setHistorial(hist.data || []);
+      return {
+        ok: true,
+        folio: folioRec,
+        cierreId: res.data?.id || null,
+        recoleccion: efectivoIe,
+        recoleccionActual: calcRec,
+        recoleccionAnteriorIncluida: maquinasEnCero ? antAntes : 0,
+        temporal: !maquinasEnCero,
+        maquinasEnCero,
+        recoleccionAnteriorTras: antTras,
+        pendienteIe: maquinasEnCero && estadoAprob === 'pendiente_admin',
+        estadoImpresion: detalle,
+        gastosImpresion: gastosAbiertos,
+        calcImpresion: { ...calc },
+      };
+    }
+
+    if (modulo === 'virtual') {
+      const calcRec =
+        opts.montoRecoleccion != null
+          ? round2(opts.montoRecoleccion)
+          : round2(estado.recoleccion ?? estado.recoleccion_turno);
+      if (!(calcRec > 0)) {
+        return alert('Indique el monto de recolección.');
+      }
+      // Historial amplio: gastos del periodo + MF del último cierre.
+      const histPeriodoRes = await listarCierresCorte(supabase, sucursal, modulo, Math.max(120, limiteHistorialCierresCorte(modulo)));
+      const histPeriodo = histPeriodoRes.data?.length ? histPeriodoRes.data : historial;
+      const mi = round2(estado.moneda_inicial_turno ?? estado.moneda_inicial);
+      const mf = monedaFinalParaInyectarVirtual(estado, histPeriodo);
+      const tope = monedaTopeVirtual(estado);
+      const monedaInyectar = round2(Math.max(0, tope - mf));
+      const gastosPeriodoLista = gastosListaDesdeUltimaRecoleccion(histPeriodo, gastos, {
+        folioAbierto: folio || 'ABIERTO',
+        turnoAbierto: estado.turno_sesion || turnoActual() || 'Corte actual',
+        usuarioAbierto: user?.nombre || null,
+      });
+      const gastosPeriodo = round2(
+        gastosPeriodoLista.reduce((a, g) => a + (Number(g.monto) || 0), 0),
+      );
+      const gastosIds = gastosPeriodoLista
+        .map((g) => (g?.id != null && g.id !== '' ? String(g.id) : null))
+        .filter(Boolean);
+      const estadoAprob = estadoAprobacionRecoleccionInicial(user?.nombre);
+      const payload = {
+        sucursal_id: sucursal || 'MAIN',
+        modulo,
+        folio: `REC-${folio || 'V'}`,
+        turno: 'RECOLECCION',
+        usuario_id: user?.id || null,
+        usuario_nombre: user?.nombre || null,
+        caja_actual: 0,
+        ventas: 0,
+        detalle: detalleRecoleccionParaIe({
+          efectivo: calcRec,
+          gastosTotal: gastosPeriodo,
+          extras: {
+            ...estado,
+            fondo: round2(estado.fondo),
+            caja_anterior: round2(estado.caja_anterior),
+            moneda_inicial: round2(estado.moneda_inicial),
+            moneda_inicial_turno: mi,
+            moneda_final: mf,
+            moneda_final_editada: true,
+            faltante: round2(estado.faltante),
+            venta: calc.venta,
+            gastos: gastosPeriodoLista,
+            gastos_ids: gastosIds,
+            gastos_turno_actual: calc.gastosTotal,
+            subtotal: calc.subtotal,
+            caja_actual: calc.cajaActual,
+            moneda_tope: tope,
+            moneda_inyectar: monedaInyectar,
+            formula_recoleccion: 'tope_menos_mf',
+            tipo_cierre: 'recoleccion',
+            estado_aprobacion: estadoAprob,
+            comentarios: estado.comentarios || '',
+          },
+        }),
+      };
+      const res = await registrarCierreCorte(supabase, payload);
+      if (!res.ok) return { ok: false, error: res.error || AVISO_FALTA_CORTES };
+
+      await sellarPrestamosColectados({
+        supabase,
+        sucursal,
+        modulo,
+        user,
+        gastos: gastosPeriodoLista,
+        gastosIds,
+        folio: payload.folio,
+      });
+
+      if (estadoAprob === 'aprobado' && res.data) {
+        try {
+          const { liberarGastosCorteAIeTrasRecoleccion } = await import('../contVirtualEgresos.js');
+          await liberarGastosCorteAIeTrasRecoleccion(supabase, res.data);
+        } catch {
+          /* no bloquear */
+        }
+      } else if (estadoAprob === 'pendiente_admin' && res.data) {
+        await notificarRecoleccionPendienteIe(supabase, res.data);
+      }
+
+      await limpiarGastosTurno(supabase, sucursal, modulo, (gastos || []).map((g) => g.id).filter(Boolean));
+      const prep = prepararTrasRecoleccion || ((e) => e);
+      const estadoConMf = {
+        ...estado,
+        moneda_final: mf,
+        moneda_final_editada: true,
+      };
+      const nuevoEstado = prep(estadoConMf, calc, {
+        monedaTope: tope,
+        montoRecoleccion: calcRec,
+      });
+      nuevoEstado.turno_sesion = snapshotTurno() || turnoActual();
+      await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
+      setEstado(nuevoEstado);
+      const gasRec = await listarGastosTurno(supabase, sucursal, modulo);
+      setGastos(gasRec.data || []);
+      const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+      setHistorial(hist.data || []);
+      return {
+        ok: true,
+        folio: payload.folio,
+        cierreId: res.data?.id || null,
+        recoleccion: calcRec,
+        monedaTope: tope,
+        monedaFinal: mf,
+        monedaInyectar,
+        miSiguiente: nuevoEstado.moneda_inicial_turno,
+        estadoImpresion: payload.detalle,
+        gastosImpresion: gastosPeriodoLista,
+        calcImpresion: { ...calc, gastosTotal: gastosPeriodo },
+        estadoAprobacion: estadoAprob,
+        pendienteIe: estadoAprob === 'pendiente_admin',
+      };
+    }
+
+    if (modulo === 'abarrotes') {
+      const calcRec =
+        opts.montoRecoleccion != null
+          ? round2(opts.montoRecoleccion)
+          : round2(estado.recoleccion ?? estado.recoleccion_turno);
+      if (!(calcRec > 0)) {
+        return alert('Indique el monto de recolección en efectivo retirado.');
+      }
+      if ((calc.cajaActual ?? 0) < -0.001) {
+        return alert(
+          `No se puede recolectar: la caja chica está en negativo (${fmtCorte(calc.cajaActual)}).`,
+        );
+      }
+      const gastosPeriodoLista = [...(gastos || [])];
+      const gastosPeriodo = round2(
+        gastosPeriodoLista.reduce((a, g) => a + (Number(g.monto) || 0), 0),
+      );
+      const gastosIds = gastosPeriodoLista
+        .map((g) => (g?.id != null && g.id !== '' ? String(g.id) : null))
+        .filter(Boolean);
+      const estadoAprob = estadoAprobacionRecoleccionInicial(user?.nombre);
+      const folioRec = `REC-${folio || estado.folio || 'A'}`;
+      const payload = {
+        sucursal_id: sucursal || 'MAIN',
+        modulo: 'abarrotes',
+        folio: folioRec,
+        turno: 'RECOLECCION',
+        usuario_id: user?.id || null,
+        usuario_nombre: user?.nombre || null,
+        caja_actual: round2(Math.max(0, calc.cajaActual)),
+        ventas: 0,
+        detalle: detalleRecoleccionParaIe({
+          efectivo: calcRec,
+          gastosTotal: gastosPeriodo,
+          extras: {
+            ...estado,
+            venta: calc.venta,
+            gastos: gastosPeriodoLista,
+            gastos_ids: gastosIds,
+            gastos_turno_actual: calc.gastosTotal,
+            subtotal: calc.subtotal,
+            caja_antes_recoleccion: round2(calc.cajaActual + calcRec),
+            tipo_cierre: 'recoleccion',
+            estado_aprobacion: estadoAprob,
+            comentarios: estado.comentarios || '',
+          },
+        }),
+      };
+      const res = await registrarCierreCorte(supabase, payload);
+      if (!res.ok) return { ok: false, error: res.error || AVISO_FALTA_CORTES };
+
+      await sellarPrestamosColectados({
+        supabase,
+        sucursal,
+        modulo,
+        user,
+        gastos: gastosPeriodoLista,
+        gastosIds,
+        folio: payload.folio,
+      });
+
+      if (estadoAprob === 'aprobado' && res.data) {
+        try {
+          const { liberarGastosCorteAIeTrasRecoleccion } = await import('../contVirtualEgresos.js');
+          await liberarGastosCorteAIeTrasRecoleccion(supabase, res.data);
+        } catch {
+          /* no bloquear */
+        }
+      } else if (estadoAprob === 'pendiente_admin' && res.data) {
+        await notificarRecoleccionPendienteIe(supabase, res.data);
+      }
+
+      // Tras recolectar: caja queda en el valor post-retiro; no se reinicia el turno.
+      const nuevoEstado = {
+        ...estado,
+        caja_anterior: round2(Math.max(0, calc.cajaActual)),
+        recoleccion: 0,
+        recoleccion_turno: 0,
+      };
+      await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
+      setEstado(nuevoEstado);
+      const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+      setHistorial(hist.data || []);
+      return {
+        ok: true,
+        folio: payload.folio,
+        cierreId: res.data?.id || null,
+        recoleccion: calcRec,
+        estadoAprobacion: estadoAprob,
+        pendienteIe: estadoAprob === 'pendiente_admin',
+        estadoImpresion: payload.detalle,
+        gastosImpresion: gastosPeriodoLista,
+        calcImpresion: { ...calc, gastosTotal: gastosPeriodo },
+      };
+    }
+
+    const { corteAnteriorId, monedaFinalAnterior } = opts;
+    if (!estado._precoleccion_editada && !round2(estado.precoleccion)) {
+      return alert('Capture la moneda final de recolección (moneda en caja) antes de registrar.');
+    }
+    const montoRec = round2(estado.recoleccion ?? estado.recoleccion_turno);
+    if (!(montoRec > 0)) return alert('Indique el monto de recolección en efectivo retirado.');
+    if ((calc.cajaActual ?? 0) < -0.001) {
+      return alert(`No se puede recolectar: la caja chica está en negativo (${fmtCorte(calc.cajaActual)}).`);
+    }
+
+    const mf = round2(estado.precoleccion);
+    const monedaTope = monedaTopeVirtual(estado);
+    const monedaInyectar = monedaAInyectarVirtual(estado, mf);
+    if (corteAnteriorId && monedaFinalAnterior != null && monedaFinalAnterior !== '') {
+      const upd = await actualizarDetalleCierre(
+        supabase,
+        corteAnteriorId,
+        { moneda_final: round2(monedaFinalAnterior), moneda_final_editada: true },
+        sucursal,
+        modulo,
+      );
+      if (!upd.ok) return alert(upd.error || 'No se pudo actualizar el corte anterior.');
+    }
+
+    const gastosPeriodo = gastosPeriodoDesdeUltimaRecoleccion(historial, calc.gastosTotal);
+    const gastosIds = gastosIdsDesdeUltimaRecoleccion(historial, gastos);
+    const estadoAprob = estadoAprobacionRecoleccionInicial(user?.nombre);
+    const payload = {
+      sucursal_id: sucursal || 'MAIN',
+      modulo,
+      folio: `REC-${folio || 'V'}`,
+      turno: 'RECOLECCION',
+      usuario_id: user?.id || null,
+      usuario_nombre: user?.nombre || null,
+      caja_actual: round2(Math.max(0, calc.cajaActual)),
+      ventas: 0,
+      detalle: detalleRecoleccionParaIe({
+        efectivo: montoRec,
+        gastosTotal: gastosPeriodo,
+        extras: {
+          ...estado,
+          fondo: round2(estado.fondo),
+          moneda_final: mf,
+          moneda_final_editada: true,
+          precoleccion: mf,
+          moneda_final_recoleccion: mf,
+          moneda_tope: monedaTope,
+          moneda_inyectar: monedaInyectar,
+          venta: 0,
+          gastos,
+          gastos_ids: gastosIds,
+          gastos_turno_actual: calc.gastosTotal,
+          subtotal: calc.subtotal,
+          caja_antes_recoleccion: round2(calc.cajaActual + montoRec),
+          corte_anterior_id: corteAnteriorId || null,
+          tipo_cierre: 'recoleccion',
+          estado_aprobacion: estadoAprob,
+          comentarios: estado.comentarios || '',
+        },
+      }),
+    };
+
+    const res = await registrarCierreCorte(supabase, payload);
+    if (!res.ok) return alert(res.error || AVISO_FALTA_CORTES);
+
+    await sellarPrestamosColectados({
+      supabase,
+      sucursal,
+      modulo,
+      user,
+      gastos,
+      gastosIds,
+      folio: payload.folio,
+    });
+
+    if (estadoAprob === 'aprobado' && res.data) {
+      try {
+        const { liberarGastosCorteAIeTrasRecoleccion } = await import('../contVirtualEgresos.js');
+        await liberarGastosCorteAIeTrasRecoleccion(supabase, res.data);
+      } catch {
+        /* no bloquear */
+      }
+    } else if (estadoAprob === 'pendiente_admin' && res.data) {
+      await notificarRecoleccionPendienteIe(supabase, res.data);
+    }
+
+    await limpiarGastosTurno(supabase, sucursal, modulo, (gastos || []).map((g) => g.id).filter(Boolean));
+    const prep = prepararTrasRecoleccion || ((e) => e);
+    const nuevoEstado = prep(estado, calc, {
+      nuevaMoneda: mf,
+      montoRecoleccion: montoRec,
+      monedaTope,
+      monedaInyectar,
+    });
+    await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
+    setEstado(nuevoEstado);
+    const gasPost = await listarGastosTurno(supabase, sucursal, modulo);
+    setGastos(gasPost.data || []);
+    const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+    setHistorial(hist.data || []);
+    const monOp = monedaTope > 0 ? monedaTope : mf;
+    const brutoIe = round2(montoRec + gastosPeriodo);
+    const avisoPend = estadoAprob === 'pendiente_admin'
+      ? '\n⚠️ Transferencia a IE pendiente de aprobación (ABB / FJBB / JLBB).\n'
+      : '';
+    alert(
+      `Recolección de ${fmtCorte(montoRec)} registrada.\n\n` +
+        `Moneda final recolección: ${fmtCorte(mf)}\n` +
+        `Moneda inicial (tope): ${fmtCorte(monedaTope)}\n` +
+        `Inyectar a sucursal: ${fmtCorte(monedaInyectar)} (no es ingreso)\n` +
+        `Ingreso en IE (bruto, sin descontar gastos): ${fmtCorte(brutoIe)}\n` +
+        `Efectivo retirado: ${fmtCorte(montoRec)} · Gastos del periodo: ${fmtCorte(gastosPeriodo)} (se descuentan solo en IE)\n` +
+        `El fondo fijo no se registra como ingreso.` +
+        avisoPend +
+        `\n\n` +
+        `Periodo reiniciado: caja y ventas en ${fmtCorte(0)}.\n` +
+        `Moneda de referencia e inicio de operación: ${fmtCorte(monOp)}.\n` +
+        `Los gastos del periodo quedan en historial y se deducen en IE (una sola vez).`,
+    );
+    return { ok: true };
+    } finally {
+      accionLock.end();
+      setCargando(false);
+    }
+  };
+
+  const eliminarCierreHistorial = async (cierreId, meta = {}) => {
+    if (!perm.editarTodo) return alert('Solo el administrador puede eliminar cierres del historial.');
+    const folio = meta.folio || cierreId;
+    const quien = String(user?.nombre || '').trim() || String(user?.id || 'admin');
+    if (
+      !confirm(
+        `¿Mover el cierre ${folio} a la papelera?\n\n` +
+          `Quedará registrado que lo borró: ${quien}.\n` +
+          `Podrás recuperarlo después desde «Cortes eliminados».`,
+      )
+    ) {
+      return;
+    }
+    const rastro = [quien, user?.rol ? String(user.rol) : null, user?.id ? `id:${user.id}` : null]
+      .filter(Boolean)
+      .join(' · ');
+    const res = await eliminarCierreCorte(supabase, cierreId, sucursal, modulo, {
+      deletedBy: rastro,
+    });
+    if (!res.ok) return alert(res.error || 'No se pudo eliminar.');
+    if (res.aviso) setAviso(res.aviso);
+    if (res.definitivo) {
+      alert('El cierre se eliminó de forma definitiva.\n\n' + (res.aviso || ''));
+    }
+    try {
+      const { auditarCorte, TIPOS_AUDITORIA } = await import('../auditoriaUso.js');
+      void auditarCorte(supabase, {
+        tipo: TIPOS_AUDITORIA.CORTE_DELETE,
+        user,
+        sucursal,
+        modulo,
+        cierreId,
+        folio,
+        extra: { definitivo: Boolean(res.definitivo), deleted_by: rastro },
+      });
+    } catch {
+      /* ignore */
+    }
+    await refrescarHistorial();
+  };
+
+  const restaurarCierreHistorial = async (cierreId, meta = {}) => {
+    if (!perm.editarTodo) return alert('Solo el administrador puede restaurar cierres.');
+    const folio = meta.folio || cierreId;
+    if (!confirm(`¿Restaurar el cierre ${folio} al historial?`)) return;
+    const res = await restaurarCierreCorte(supabase, cierreId, sucursal, modulo);
+    if (!res.ok) return alert(res.error || 'No se pudo restaurar.');
+    if (res.aviso) setAviso(res.aviso);
+    try {
+      const { auditarCorte, TIPOS_AUDITORIA } = await import('../auditoriaUso.js');
+      void auditarCorte(supabase, {
+        tipo: TIPOS_AUDITORIA.CORTE_RESTORE,
+        user,
+        sucursal,
+        modulo,
+        cierreId,
+        folio,
+      });
+    } catch {
+      /* ignore */
+    }
+    await refrescarHistorial();
+  };
+
+  const claveGastoDetalle = (g, i) =>
+    g?.id != null && g.id !== '' ? String(g.id) : `idx-${i}`;
+
+  /** Edita un gasto ya guardado en el detalle de un cierre (desglose / historial). */
+  const editarGastoEnCierre = async (cierreId, gastoKey, patch) => {
+    if (!puedeEditarCorteCampo(perm, 'gastos')) return;
+    if (!cierreId || gastoKey == null) return;
+    const cierre = (historial || []).find((h) => String(h.id) === String(cierreId));
+    if (!cierre) return alert('Cierre no encontrado.');
+    const d = cierre.detalle || {};
+    const lista = Array.isArray(d.gastos) ? [...d.gastos] : [];
+    const idx = lista.findIndex((g, i) => claveGastoDetalle(g, i) === String(gastoKey));
+    if (idx < 0) return alert('Gasto no encontrado en el cierre.');
+
+    const actual = { ...lista[idx] };
+    if (patch.monto != null) actual.monto = Number(patch.monto) || 0;
+    if (patch.categoria != null) actual.categoria = String(patch.categoria).trim().toUpperCase();
+    if (patch.subcategoria != null) actual.subcategoria = String(patch.subcategoria).trim().toUpperCase();
+    if (patch.comentario != null) actual.comentario = String(patch.comentario).trim().toUpperCase();
+    lista[idx] = actual;
+
+    const gastosTotal = round2(lista.reduce((a, g) => a + (Number(g.monto) || 0), 0));
+    const venta = Number(cierre.ventas) || Number(d.venta) || 0;
+    const subtotal = d.subtotal_manual !== '' && d.subtotal_manual != null
+      ? Number(d.subtotal_manual) || 0
+      : round2(venta - gastosTotal);
+
+    if (actual.id && !String(actual.id).startsWith('local-')) {
+      const resG = await actualizarGastoTurno(supabase, actual.id, patch, sucursal, modulo);
+      if (!resG.ok) return alert(resG.error || 'No se pudo actualizar el gasto.');
+    }
+
+    const res = await actualizarDetalleCierre(
+      supabase,
+      cierreId,
+      { gastos: lista, gastos_total: gastosTotal, subtotal },
+      sucursal,
+      modulo,
+    );
+    if (!res.ok) return alert(res.error || 'No se pudo actualizar el cierre.');
+    await refrescarHistorial();
+  };
+
+  /** Elimina un gasto del detalle de un cierre (desglose / historial). */
+  const eliminarGastoEnCierre = async (cierreId, gastoKey) => {
+    if (!puedeEditarCorteCampo(perm, 'gastos')) return;
+    if (!cierreId || gastoKey == null) return;
+    if (!confirm('¿Eliminar este gasto del cierre?')) return;
+    const cierre = (historial || []).find((h) => String(h.id) === String(cierreId));
+    if (!cierre) return alert('Cierre no encontrado.');
+    const d = cierre.detalle || {};
+    const listaPrev = Array.isArray(d.gastos) ? d.gastos : [];
+    const idx = listaPrev.findIndex((g, i) => claveGastoDetalle(g, i) === String(gastoKey));
+    if (idx < 0) return alert('Gasto no encontrado en el cierre.');
+    const quitado = listaPrev[idx];
+    const lista = listaPrev.filter((_, i) => i !== idx);
+
+    const gastosTotal = round2(lista.reduce((a, g) => a + (Number(g.monto) || 0), 0));
+    const venta = Number(cierre.ventas) || Number(d.venta) || 0;
+    const subtotal = d.subtotal_manual !== '' && d.subtotal_manual != null
+      ? Number(d.subtotal_manual) || 0
+      : round2(venta - gastosTotal);
+
+    if (quitado?.id && !String(quitado.id).startsWith('local-')) {
+      const resG = await eliminarGastoTurno(supabase, quitado.id, sucursal, modulo);
+      if (!resG.ok) return alert(resG.error || 'No se pudo eliminar el gasto.');
+    }
+
+    const res = await actualizarDetalleCierre(
+      supabase,
+      cierreId,
+      { gastos: lista, gastos_total: gastosTotal, subtotal },
+      sucursal,
+      modulo,
+    );
+    if (!res.ok) return alert(res.error || 'No se pudo actualizar el cierre.');
+    await refrescarHistorial();
+  };
+
+  /** Corrige ventas/caja/folio/comentarios de un cierre del historial. */
+  const editarCierreHistorial = async (cierreId, patch) => {
+    const r = normalizarRol(user?.rol);
+    if (!(perm.editarTodo || r === 'Gerente' || r === 'Supervisor')) {
+      return { ok: false, error: 'Tu rol no puede editar cortes guardados.' };
+    }
+    const res = await actualizarCierreCorte(supabase, cierreId, patch, sucursal, modulo);
+    if (!res.ok) return res;
+    try {
+      const { auditarCorte, TIPOS_AUDITORIA } = await import('../auditoriaUso.js');
+      void auditarCorte(supabase, {
+        tipo: TIPOS_AUDITORIA.CORTE_EDIT,
+        user,
+        sucursal,
+        modulo,
+        cierreId,
+        folio: patch?.folio || cierreId,
+        extra: { campos: Object.keys(patch || {}) },
+      });
+    } catch {
+      /* ignore */
+    }
+    const hist = await listarCierresCorte(supabase, sucursal, modulo, limiteHistorialCierresCorte(modulo));
+    setHistorial(hist.data || []);
+    return { ok: true };
+  };
+
+  return {
+    estado,
+    patchEstado: patchEstadoPermitido,
+    gastos,
+    agregarGasto,
+    quitarGasto,
+    editarGasto,
+    calc,
+    folio,
+    setFolio,
+    turno,
+    perm,
+    aviso,
+    cargando,
+    historial,
+    historialEliminados,
+    empleados,
+    cerrarCorte,
+    registrarRecoleccion,
+    eliminarCierreHistorial,
+    editarCierreHistorial,
+    restaurarCierreHistorial,
+    editarGastoEnCierre,
+    eliminarGastoEnCierre,
+    recargar: cargar,
+    vistaRecuperacion,
+    puedeAbonarLiquidarPrestamo,
+    puedeGenerarPagareCorte,
+    abonarPrestamoDesdeCorte,
+    liquidarPrestamoDesdeCorte,
+    generarPagareDesdeCorte,
+    refrescarPrestamosRecuperacion,
+  };
+}
+
+export function fmtCorte(n) {
+  return `$${(Number(n) || 0).toFixed(2)}`;
+}
