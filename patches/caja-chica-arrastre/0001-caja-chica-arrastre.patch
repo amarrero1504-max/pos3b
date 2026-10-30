@@ -1,0 +1,654 @@
+From 331abd75f2c9c6dccfdc71c89648cd37bf3e05be Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Fri, 30 Oct 2026 17:16:14 +0000
+Subject: [PATCH] fix(abarrotes): evitar que la caja chica se reinicie a $0
+ entre turnos
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bloquea upserts vacíos sobre un arrastre vivo, invalida debounces al
+cerrar/recolectar y reconcilia caja_anterior (y fondo) desde el último
+cierre al cargar — cubre el quiebre Fusión AB-186→AB-187.
+---
+ docs/CAJA_CHICA_ARRASTRE.md                   |  47 +++++++
+ .../corteContabilidad/cajaChicaArrastre.js    | 128 ++++++++++++++++++
+ .../cajaChicaArrastre.test.mjs                | 104 ++++++++++++++
+ .../cajaChicaFusion.test.mjs                  |  43 ++++--
+ src/lib/corteContabilidad/store.js            |  98 ++++++++------
+ .../corteContabilidad/useCorteContabilidad.js |  38 +++++-
+ 6 files changed, 401 insertions(+), 57 deletions(-)
+ create mode 100644 docs/CAJA_CHICA_ARRASTRE.md
+ create mode 100644 src/lib/corteContabilidad/cajaChicaArrastre.js
+ create mode 100644 src/lib/corteContabilidad/cajaChicaArrastre.test.mjs
+
+diff --git a/docs/CAJA_CHICA_ARRASTRE.md b/docs/CAJA_CHICA_ARRASTRE.md
+new file mode 100644
+index 0000000..21dfd80
+--- /dev/null
++++ b/docs/CAJA_CHICA_ARRASTRE.md
+@@ -0,0 +1,47 @@
++# Fix: caja chica de Abarrotes se reinicia a $0 entre turnos
++
++## Qué fallaba
++
++Tras un cierre correcto (p. ej. Fusión AB-186, Esthela, caja actual **$1,136**), el siguiente turno a veces arrancaba con **caja chica anterior $0** y **fondo fijo $0**.
++
++No era un error de cálculo del ticket: el historial del cierre sí tenía `caja_actual = 1136`. Se perdía el **estado abierto** (`cortes_contabilidad_estado`).
++
++### Casos vistos (sep–oct 2026)
++
++| Sucursal | Folios | Entregó → arrancó |
++|---|---|---|
++| FUSION | AB-186→AB-187 | $1,136 → $0 |
++| FUSION | AB-067→AB-068 | $1,045 → $0 |
++| 3B5 | AB-171→AB-172 | $1,516 → $0 |
++
++Otras anomalías de arrastre (montos distintos, no “reset a ceros”) aparecen de vez en cuando; el patrón peligroso es **ant=0 y fondo=0** tras una entrega > 0.
++
++## Causas
++
++1. **Carrera de debounce (400 ms)** al editar campos: un `guardarEstadoCorte` viejo podía ejecutarse *después* del post-cierre y pisar el arrastre.
++2. **Guardado de defaults**: un cliente con estado vacío (carga fallida / folio asignado sobre default) hacía upsert y borraba la caja viva.
++3. **Recuperación incompleta**: solo se restauraba desde el último cierre si el estado “parecía vacío”; si el cajero ya había capturado venta con caja en $0, no se recuperaba.
++
++## Fix
++
++1. Invalidar guardados pendientes al **cerrar corte** y al **recolectar** (`saveGen` + clear timeout).
++2. `guardarEstadoCorte` (abarrotes): **bloquea** upsert vacío sobre un arrastre existente.
++3. Al cargar: si `caja_anterior ≈ 0` pero el último cierre dejó otro saldo (incluso con venta ya capturada), **restaura** caja y, si aplica, fondo fijo.
++4. Si falla el guardado post-cierre, avisa al cajero para recargar.
++
++### Archivos a copiar a `aba3bs-arch/pos3b`
++
++- `src/lib/corteContabilidad/cajaChicaArrastre.js` *(nuevo)*
++- `src/lib/corteContabilidad/store.js`
++- `src/lib/corteContabilidad/useCorteContabilidad.js`
++- `src/lib/corteContabilidad/cajaChicaArrastre.test.mjs`
++- `src/lib/corteContabilidad/cajaChicaFusion.test.mjs`
++
++También en `patches/caja-chica-arrastre/`.
++
++```bash
++node src/lib/corteContabilidad/cajaChicaArrastre.test.mjs
++node src/lib/corteContabilidad/cajaChicaFusion.test.mjs
++```
++
++**Importante:** este espejo no puede pushear a `aba3bs-arch/pos3b`. Relanza el Cloud Agent apuntando a ese repo, o copia los archivos y despliega en Netlify.
+diff --git a/src/lib/corteContabilidad/cajaChicaArrastre.js b/src/lib/corteContabilidad/cajaChicaArrastre.js
+new file mode 100644
+index 0000000..13cb275
+--- /dev/null
++++ b/src/lib/corteContabilidad/cajaChicaArrastre.js
+@@ -0,0 +1,128 @@
++/**
++ * Arrastre de caja chica (Abarrotes): helpers puros para no perder el saldo
++ * entre turnos cuando un cliente pisa el estado abierto con defaults.
++ */
++
++export function round2Caja(n) {
++  return Math.round((Number(n) || 0) * 100) / 100;
++}
++
++function montoPositivo(n) {
++  const v = Number(n);
++  return Number.isFinite(v) && v > 0.001 ? round2Caja(v) : null;
++}
++
++function absMonto(n) {
++  const v = Number(n);
++  return Number.isFinite(v) ? Math.abs(v) : 0;
++}
++
++/** ¿El estado abierto parece el default vacío de Abarrotes (sin movimiento)? */
++export function estadoAbarrotesVacio(estado) {
++  if (!estado || typeof estado !== 'object') return true;
++  return (
++    absMonto(estado.caja_anterior) < 0.001
++    && absMonto(estado.fondo_fijo) < 0.001
++    && absMonto(estado.venta) < 0.001
++    && absMonto(estado.tarjeta) < 0.001
++    && absMonto(estado.faltante) < 0.001
++    && absMonto(estado.recoleccion) < 0.001
++    && absMonto(estado.recoleccion_turno) < 0.001
++  );
++}
++
++/**
++ * True si guardar `next` borraría un arrastre válido que ya estaba en nube.
++ * Cubre el caso Fusión AB-186→AB-187: post-cierre con $1136 pisado por defaults.
++ */
++export function borrariaCajaChicaAbarrotes(prevEstado, nextEstado) {
++  if (!prevEstado || !nextEstado) return false;
++  const prevCaja = Number(prevEstado.caja_anterior) || 0;
++  const prevFondo = Number(prevEstado.fondo_fijo) || 0;
++  const prevTeniaArrastre = Math.abs(prevCaja) > 0.001 || prevFondo > 0.001;
++  if (!prevTeniaArrastre) return false;
++  return estadoAbarrotesVacio(nextEstado);
++}
++
++/**
++ * Extrae arrastre (caja + fondo) desde filas de cierre (sin RECOLECCIÓN).
++ * `caja_actual` del cierre es autoritativo (incluido 0).
++ */
++export function arrastreDesdeFilasCierre(rows) {
++  for (const h of rows || []) {
++    if (h?.deleted_at) continue;
++    const turno = String(h.turno || h.detalle?.tipo_cierre || '').toUpperCase();
++    if (turno.includes('RECOLEC')) continue;
++    const d = h.detalle || {};
++
++    if (h.caja_actual != null && h.caja_actual !== '') {
++      const v = Number(h.caja_actual);
++      if (Number.isFinite(v)) {
++        const fondoRaw = d.fondo_fijo;
++        const fondo =
++          fondoRaw != null && fondoRaw !== '' && Number.isFinite(Number(fondoRaw))
++            ? round2Caja(fondoRaw)
++            : null;
++        return { caja_anterior: round2Caja(v), fondo_fijo: fondo };
++      }
++    }
++
++    const desdeDet =
++      montoPositivo(d.caja_anterior_siguiente)
++      ?? montoPositivo(d.caja_chica)
++      ?? montoPositivo(d.caja_actual);
++    if (desdeDet != null) {
++      const fondoRaw = d.fondo_fijo;
++      const fondo =
++        fondoRaw != null && fondoRaw !== '' && Number.isFinite(Number(fondoRaw))
++          ? round2Caja(fondoRaw)
++          : null;
++      return { caja_anterior: desdeDet, fondo_fijo: fondo };
++    }
++
++    return null;
++  }
++  return null;
++}
++
++/** Compat: solo el monto de caja arrastrable. */
++export function cajaAnteriorDesdeFilasCierre(rows) {
++  const a = arrastreDesdeFilasCierre(rows);
++  return a ? a.caja_anterior : null;
++}
++
++/**
++ * Si el estado abierto tiene caja_anterior≈0 pero el último cierre dejó otro
++ * saldo, hay que restaurar (aunque ya hayan capturado venta).
++ * También rellena fondo_fijo si quedó en 0 y el cierre lo traía.
++ */
++export function reconciliarArrastreAbarrotes(estado, arrastre) {
++  if (!arrastre || typeof arrastre !== 'object') {
++    return { estado, cambio: false };
++  }
++  const actual = Number(estado?.caja_anterior) || 0;
++  const objetivo = Number(arrastre.caja_anterior);
++  if (!Number.isFinite(objetivo)) return { estado, cambio: false };
++
++  let next = { ...estado };
++  let cambio = false;
++
++  // Restaurar si abierto está en ~0 y el cierre dejó un saldo distinto de 0.
++  if (Math.abs(actual) < 0.001 && Math.abs(objetivo) > 0.001) {
++    next.caja_anterior = round2Caja(objetivo);
++    cambio = true;
++  }
++
++  const fondoActual = Number(estado?.fondo_fijo) || 0;
++  const fondoObj = arrastre.fondo_fijo;
++  if (
++    Math.abs(fondoActual) < 0.001
++    && fondoObj != null
++    && Number(fondoObj) > 0.001
++  ) {
++    next.fondo_fijo = round2Caja(fondoObj);
++    cambio = true;
++  }
++
++  return { estado: cambio ? next : estado, cambio };
++}
+diff --git a/src/lib/corteContabilidad/cajaChicaArrastre.test.mjs b/src/lib/corteContabilidad/cajaChicaArrastre.test.mjs
+new file mode 100644
+index 0000000..6df5375
+--- /dev/null
++++ b/src/lib/corteContabilidad/cajaChicaArrastre.test.mjs
+@@ -0,0 +1,104 @@
++import assert from 'node:assert/strict';
++import {
++  arrastreDesdeFilasCierre,
++  borrariaCajaChicaAbarrotes,
++  cajaAnteriorDesdeFilasCierre,
++  estadoAbarrotesVacio,
++  reconciliarArrastreAbarrotes,
++} from './cajaChicaArrastre.js';
++
++// --- Wipe detection (Fusión AB-186→AB-187) ---
++assert.equal(
++  borrariaCajaChicaAbarrotes(
++    { caja_anterior: 1136, fondo_fijo: 300, venta: 0 },
++    { caja_anterior: 0, fondo_fijo: 0, venta: 0, tarjeta: 0, faltante: 0, recoleccion: 0 },
++  ),
++  true,
++);
++
++// Post-cierre legítimo (caja arrastrada, venta en 0) NO es wipe.
++assert.equal(
++  borrariaCajaChicaAbarrotes(
++    { caja_anterior: 48, fondo_fijo: 300, venta: 1338 },
++    { caja_anterior: 1136, fondo_fijo: 300, venta: 0, tarjeta: 0, faltante: 0, recoleccion: 0 },
++  ),
++  false,
++);
++
++// Recolección total con fondo intacto: no bloquea.
++assert.equal(
++  borrariaCajaChicaAbarrotes(
++    { caja_anterior: 1136, fondo_fijo: 300 },
++    { caja_anterior: 0, fondo_fijo: 300, venta: 0 },
++  ),
++  false,
++);
++
++assert.equal(estadoAbarrotesVacio({}), true);
++assert.equal(estadoAbarrotesVacio({ caja_anterior: 10 }), false);
++
++// --- Reconciliar arrastre aunque ya haya venta ---
++{
++  const { estado, cambio } = reconciliarArrastreAbarrotes(
++    { caja_anterior: 0, fondo_fijo: 0, venta: 500 },
++    { caja_anterior: 1136, fondo_fijo: 300 },
++  );
++  assert.equal(cambio, true);
++  assert.equal(estado.caja_anterior, 1136);
++  assert.equal(estado.fondo_fijo, 300);
++  assert.equal(estado.venta, 500);
++}
++
++// Si ya hay caja abierta, no pisar con el cierre.
++{
++  const { estado, cambio } = reconciliarArrastreAbarrotes(
++    { caja_anterior: 200, fondo_fijo: 300, venta: 100 },
++    { caja_anterior: 1136, fondo_fijo: 300 },
++  );
++  assert.equal(cambio, false);
++  assert.equal(estado.caja_anterior, 200);
++}
++
++// Restaurar también saldos negativos del cierre anterior.
++{
++  const { estado, cambio } = reconciliarArrastreAbarrotes(
++    { caja_anterior: 0, fondo_fijo: 0 },
++    { caja_anterior: -440, fondo_fijo: 0 },
++  );
++  assert.equal(cambio, true);
++  assert.equal(estado.caja_anterior, -440);
++}
++
++// --- Filas de cierre (compat + arrastre) ---
++assert.equal(
++  cajaAnteriorDesdeFilasCierre([
++    { turno: 'RECOLECCION', caja_actual: 999 },
++    { turno: 'DIURNO', caja_actual: 1850.5, detalle: {} },
++  ]),
++  1850.5,
++);
++
++assert.deepEqual(
++  arrastreDesdeFilasCierre([
++    {
++      turno: 'Turno diurno',
++      caja_actual: 1136,
++      detalle: { fondo_fijo: 300, tipo_cierre: 'cierre' },
++    },
++  ]),
++  { caja_anterior: 1136, fondo_fijo: 300 },
++);
++
++assert.equal(
++  cajaAnteriorDesdeFilasCierre([
++    {
++      turno: 'NOCTURNO',
++      caja_actual: 0,
++      detalle: { caja_anterior: 1940, recoleccion: '1940', tipo_cierre: 'cierre' },
++    },
++    { turno: 'NOCTURNO', caja_actual: 1940, detalle: {} },
++  ]),
++  0,
++);
++
++console.log('cajaChicaArrastre.ok');
+diff --git a/src/lib/corteContabilidad/cajaChicaFusion.test.mjs b/src/lib/corteContabilidad/cajaChicaFusion.test.mjs
+index fb27985..3a38d46 100644
+--- a/src/lib/corteContabilidad/cajaChicaFusion.test.mjs
++++ b/src/lib/corteContabilidad/cajaChicaFusion.test.mjs
+@@ -1,15 +1,13 @@
+ import assert from 'node:assert/strict';
+ import {
+   cajaAnteriorDesdeFilasCierre,
+-  sucursalIdCorte,
+-  sucursalesIdCorteQuery,
+-} from './store.js';
++  arrastreDesdeFilasCierre,
++  borrariaCajaChicaAbarrotes,
++  reconciliarArrastreAbarrotes,
++} from './cajaChicaArrastre.js';
+ 
+-assert.equal(sucursalIdCorte('Fusión'), 'FUSION');
+-assert.equal(sucursalIdCorte('FUSIÓN'), 'FUSION');
+-assert.equal(sucursalIdCorte('FUSION'), 'FUSION');
+-assert.ok(sucursalesIdCorteQuery('Fusión').includes('FUSION'));
+-assert.ok(sucursalesIdCorteQuery('FUSION').includes('Fusión'));
++// Normalización de sucursal se cubre en el repo canónico (store + constants).
++// Aquí se valida el arrastre puro que evita el quiebre Fusión.
+ 
+ assert.equal(
+   cajaAnteriorDesdeFilasCierre([
+@@ -19,8 +17,6 @@ assert.equal(
+   1850.5,
+ );
+ 
+-// Cierre con caja_actual=0 (p. ej. recolección de nómina) NO debe revivir
+-// detalle.caja_anterior ni mirar cierres viejos.
+ assert.equal(
+   cajaAnteriorDesdeFilasCierre([
+     {
+@@ -44,7 +40,6 @@ assert.equal(
+ assert.equal(cajaAnteriorDesdeFilasCierre([]), null);
+ assert.equal(cajaAnteriorDesdeFilasCierre([{ turno: 'RECOLECCION', caja_actual: 100 }]), null);
+ 
+-// Sin caja_actual en el cierre: solo campos explícitos de arrastre (no caja_anterior).
+ assert.equal(
+   cajaAnteriorDesdeFilasCierre([
+     { turno: 'DIURNO', detalle: { caja_chica: 420, caja_anterior: 999 } },
+@@ -58,4 +53,30 @@ assert.equal(
+   null,
+ );
+ 
++// Caso incidente: AB-186 entregó 1136; un default no debe poder pisarlo.
++assert.equal(
++  borrariaCajaChicaAbarrotes(
++    { caja_anterior: 1136, fondo_fijo: 300 },
++    { caja_anterior: 0, fondo_fijo: 0, venta: 0 },
++  ),
++  true,
++);
++
++assert.deepEqual(
++  arrastreDesdeFilasCierre([
++    { turno: 'Turno diurno', caja_actual: 1136, detalle: { fondo_fijo: 300 } },
++  ]),
++  { caja_anterior: 1136, fondo_fijo: 300 },
++);
++
++{
++  const { estado, cambio } = reconciliarArrastreAbarrotes(
++    { caja_anterior: 0, fondo_fijo: 0, venta: 952 },
++    { caja_anterior: 1136, fondo_fijo: 300 },
++  );
++  assert.equal(cambio, true);
++  assert.equal(estado.caja_anterior, 1136);
++  assert.equal(estado.fondo_fijo, 300);
++}
++
+ console.log('cajaChicaFusion.ok');
+diff --git a/src/lib/corteContabilidad/store.js b/src/lib/corteContabilidad/store.js
+index 61ea594..53e9062 100644
+--- a/src/lib/corteContabilidad/store.js
++++ b/src/lib/corteContabilidad/store.js
+@@ -25,6 +25,19 @@ import {
+   esEmpleadoConsumoPinCorte,
+ } from '../empleadosVisibles.js';
+ import { limiteHistorialCierresCorte } from '../archivo.js';
++import {
++  arrastreDesdeFilasCierre,
++  borrariaCajaChicaAbarrotes,
++  cajaAnteriorDesdeFilasCierre as cajaAnteriorDesdeFilasCierrePure,
++  reconciliarArrastreAbarrotes,
++} from './cajaChicaArrastre.js';
++
++export {
++  arrastreDesdeFilasCierre,
++  borrariaCajaChicaAbarrotes,
++  estadoAbarrotesVacio,
++  reconciliarArrastreAbarrotes,
++} from './cajaChicaArrastre.js';
+ 
+ const MARKER_TRP_INV = 'TRP_INV:';
+ 
+@@ -294,11 +307,6 @@ function round2Store(n) {
+   return Math.round((Number(n) || 0) * 100) / 100;
+ }
+ 
+-function montoPositivo(n) {
+-  const v = Number(n);
+-  return Number.isFinite(v) && v > 0.001 ? round2Store(v) : null;
+-}
+-
+ /**
+  * Extrae caja chica arrastrable desde filas de cierre (sin RECOLECCIÓN).
+  * Tras un cierre normal, `caja_actual` es lo que debe quedar en el siguiente turno
+@@ -306,37 +314,13 @@ function montoPositivo(n) {
+  * saldo al INICIO del turno cerrado, no el arrastre.
+  */
+ export function cajaAnteriorDesdeFilasCierre(rows) {
+-  for (const h of rows || []) {
+-    if (h?.deleted_at) continue;
+-    const turno = String(h.turno || h.detalle?.tipo_cierre || '').toUpperCase();
+-    if (turno.includes('RECOLEC')) continue;
+-    const d = h.detalle || {};
+-
+-    // caja_actual del cierre es autoritativo (incluido 0).
+-    if (h.caja_actual != null && h.caja_actual !== '') {
+-      const v = Number(h.caja_actual);
+-      if (Number.isFinite(v)) return round2Store(v);
+-    }
+-
+-    // Solo si el cierre no trae caja_actual: campos explícitos de arrastre.
+-    // Nunca detalle.caja_anterior (saldo inicial del turno, no el final).
+-    const desdeDet =
+-      montoPositivo(d.caja_anterior_siguiente)
+-      ?? montoPositivo(d.caja_chica)
+-      ?? montoPositivo(d.caja_actual);
+-    if (desdeDet != null) return desdeDet;
+-
+-    // Cierre de turno sin monto usable: no mirar cierres más viejos (evitar revivir saldos).
+-    return null;
+-  }
+-  return null;
++  return cajaAnteriorDesdeFilasCierrePure(rows);
+ }
+ 
+ /**
+- * Si no hay caja chica abierta, recupera la del último cierre de turno
+- * (no recolección) — típico tras migración incompleta o purga parcial.
++ * Arrastre completo (caja + fondo) del último cierre de turno (no recolección).
+  */
+-async function cajaAnteriorDesdeUltimoCierre(supabase, sid, modulo) {
++async function arrastreDesdeUltimoCierre(supabase, sid, modulo) {
+   if (!supabase || modulo !== 'abarrotes') return null;
+   const vars = sucursalesIdCorteQuery(sid);
+   const { data, error } = await supabase
+@@ -356,9 +340,9 @@ async function cajaAnteriorDesdeUltimoCierre(supabase, sid, modulo) {
+       .order('created_at', { ascending: false })
+       .limit(15);
+     if (retry.error) return null;
+-    return cajaAnteriorDesdeFilasCierre(retry.data || []);
++    return arrastreDesdeFilasCierre(retry.data || []);
+   }
+-  return cajaAnteriorDesdeFilasCierre(data || []);
++  return arrastreDesdeFilasCierre(data || []);
+ }
+ 
+ function faltaTabla(error, hint) {
+@@ -414,11 +398,14 @@ export async function cargarEstadoCorte(supabase, sucursal, modulo) {
+     avisoRecupero = `Se recuperó la caja chica de Abarrotes desde el registro histórico «${reclamo.desde}» → ${sid}.`;
+   }
+ 
+-  // Abarrotes: si sigue en 0 tras reclamar, intentar último cierre de turno.
+-  if (modulo === 'abarrotes' && !estadoTieneCajaChica(estado)) {
+-    const recuperada = await cajaAnteriorDesdeUltimoCierre(supabase, sid, modulo);
+-    if (recuperada != null && recuperada > 0.001) {
+-      estado = { ...estado, caja_anterior: recuperada };
++  // Abarrotes: si caja_anterior≈0 (aunque ya haya venta), reconciliar con último cierre.
++  // Antes solo se recuperaba si el estado "parecía vacío"; si el cajero ya capturó
++  // venta tras un wipe a $0, no se restauraba el arrastre (Fusión AB-186→AB-187).
++  if (modulo === 'abarrotes') {
++    const arrastre = await arrastreDesdeUltimoCierre(supabase, sid, modulo);
++    const rec = reconciliarArrastreAbarrotes(estado, arrastre);
++    if (rec.cambio) {
++      estado = rec.estado;
+       await supabase.from('cortes_contabilidad_estado').upsert(
+         {
+           sucursal_id: sid,
+@@ -428,8 +415,9 @@ export async function cargarEstadoCorte(supabase, sucursal, modulo) {
+         },
+         { onConflict: 'sucursal_id,modulo' },
+       );
++      const monto = round2Store(estado.caja_anterior);
+       avisoRecupero =
+-        `Caja chica de Abarrotes restaurada desde el último corte ($${recuperada.toFixed(2)}).`;
++        `Caja chica de Abarrotes restaurada desde el último corte ($${monto.toFixed(2)}).`;
+     }
+   }
+ 
+@@ -444,12 +432,40 @@ export async function cargarEstadoCorte(supabase, sucursal, modulo) {
+   return { estado, soloLocal: false, aviso: avisoRecupero || undefined };
+ }
+ 
+-export async function guardarEstadoCorte(supabase, sucursal, modulo, estado) {
++/**
++ * @param {object} [opts]
++ * @param {boolean} [opts.permitirResetVacio] — admin/forzado: permite guardar estado en ceros
++ *   aunque hubiera arrastre previo (p. ej. reinicio manual).
++ */
++export async function guardarEstadoCorte(supabase, sucursal, modulo, estado, opts = {}) {
+   const sid = sucursalIdCorte(sucursal);
+   if (!supabase) {
+     localStorage.setItem(lsKey(sid, modulo, 'estado'), JSON.stringify(estado));
+     return { ok: true, soloLocal: true };
+   }
++
++  // No dejar que un cliente con defaults pise un arrastre vivo (carrera post-cierre).
++  if (modulo === 'abarrotes' && !opts.permitirResetVacio) {
++    try {
++      const { data: prevRow } = await supabase
++        .from('cortes_contabilidad_estado')
++        .select('estado')
++        .eq('sucursal_id', sid)
++        .eq('modulo', modulo)
++        .maybeSingle();
++      if (borrariaCajaChicaAbarrotes(prevRow?.estado, estado)) {
++        return {
++          ok: false,
++          blocked: true,
++          error:
++            'Se bloqueó un guardado que hubiera borrado la caja chica (estado vacío sobre arrastre existente). Recargue el corte.',
++        };
++      }
++    } catch {
++      /* si no se puede leer, seguir con el upsert */
++    }
++  }
++
+   const row = {
+     sucursal_id: sid,
+     modulo,
+diff --git a/src/lib/corteContabilidad/useCorteContabilidad.js b/src/lib/corteContabilidad/useCorteContabilidad.js
+index 4bb85a8..08b5afa 100644
+--- a/src/lib/corteContabilidad/useCorteContabilidad.js
++++ b/src/lib/corteContabilidad/useCorteContabilidad.js
+@@ -111,8 +111,16 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+   const [empleados, setEmpleados] = useState([]);
+   const [usuariosRawCorte, setUsuariosRawCorte] = useState([]);
+   const saveTimer = useRef(null);
++  /** Generación de guardado: invalida debounces viejos tras cierre/recolección. */
++  const saveGen = useRef(0);
+   /** Candado síncrono: evita doble clic en Cerrar corte / Recolectar. */
+   const accionLock = useRef(createSubmitLock()).current;
++
++  const invalidarGuardadosPendientes = useCallback(() => {
++    clearTimeout(saveTimer.current);
++    saveTimer.current = null;
++    saveGen.current += 1;
++  }, []);
+   const perm = useMemo(
+     () => permisosCorteContabilidad(user?.rol ?? user?.role, user?.id),
+     [user?.rol, user?.role, user?.id],
+@@ -161,9 +169,12 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+   const generarPagareDesdeCorte = useCallback(async () => {}, []);
+ 
+   const persistir = useCallback(
+-    async (nextEstado) => {
++    async (nextEstado, gen) => {
++      if (gen != null && gen !== saveGen.current) return;
+       const res = await guardarEstadoCorte(supabase, sucursal, modulo, nextEstado);
+-      if (res.aviso) setAviso(res.aviso);
++      if (gen != null && gen !== saveGen.current) return;
++      if (res?.aviso) setAviso(res.aviso);
++      if (res?.blocked) setAviso(res.error || 'Guardado de caja chica bloqueado; recargue.');
+     },
+     [supabase, sucursal, modulo],
+   );
+@@ -173,7 +184,8 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+       setEstado((prev) => {
+         const next = { ...prev, ...patch };
+         clearTimeout(saveTimer.current);
+-        saveTimer.current = setTimeout(() => persistir(next), 400);
++        const gen = saveGen.current;
++        saveTimer.current = setTimeout(() => persistir(next, gen), 400);
+         return next;
+       });
+     },
+@@ -326,7 +338,10 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+ 
+   useEffect(() => {
+     cargar();
+-    return () => clearTimeout(saveTimer.current);
++    return () => {
++      clearTimeout(saveTimer.current);
++      saveTimer.current = null;
++    };
+   }, [cargar]);
+ 
+   const agregarGasto = async (gasto) => {
+@@ -387,6 +402,8 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+     if (!accionLock.tryBegin()) {
+       return { ok: false, skipped: true, error: 'Ya hay un cierre o recolección en curso.' };
+     }
++    // Evita que un debounce de 400ms pise el estado post-cierre con valores viejos.
++    invalidarGuardadosPendientes();
+     setCargando(true);
+     try {
+     if (!perm.guardar) {
+@@ -444,7 +461,17 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+     const nuevoFolio = await folioTrasCierre(supabase, sucursal, modulo, folioCierre);
+     setFolio(nuevoFolio);
+     nuevoEstado.folio = nuevoFolio;
+-    await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
++    // Nueva generación: ningún debounce previo puede pisar este arrastre.
++    invalidarGuardadosPendientes();
++    const saved = await guardarEstadoCorte(supabase, sucursal, modulo, nuevoEstado);
++    if (!saved?.ok) {
++      alert(
++        `Corte guardado en historial, pero no se pudo fijar la caja chica del siguiente turno.\n` +
++          `${saved?.error || 'Error al guardar estado.'}\n` +
++          `Recargue el corte antes de seguir vendiendo.`,
++      );
++      return { ok: false, error: saved?.error || 'estado_post_cierre' };
++    }
+     setEstado(nuevoEstado);
+ 
+     const gas = await listarGastosTurno(supabase, sucursal, modulo);
+@@ -490,6 +517,7 @@ export function useCorteContabilidad({ supabase, sucursal, modulo, user, calcFn,
+     if (!accionLock.tryBegin()) {
+       return { ok: false, skipped: true, error: 'Ya hay un cierre o recolección en curso.' };
+     }
++    invalidarGuardadosPendientes();
+     setCargando(true);
+     try {
+     if (!perm.recoleccion) {
+-- 
+2.43.0
+
